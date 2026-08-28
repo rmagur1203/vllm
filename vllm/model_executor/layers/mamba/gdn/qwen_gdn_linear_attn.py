@@ -86,6 +86,29 @@ if GDN_AITER_TRITON_AVAILABLE:
 
 logger = init_logger(__name__)
 
+# --------------------------------------------------------------------------
+# DDTree: 하이브리드 타깃의 재귀 계층을 트리로 만들기 위한 훅.
+#
+# 재귀 계층은 상태가 주어진 순서대로 전진하므로, 트리 노드를 선형 시퀀스로 넣으면
+# 형제끼리 상태가 섞인다. 어텐션 마스크로는 막을 수 없다.
+#   - conv : 커널을 '수정' 해 윈도를 조상 열에서 읽게 한다 (tree_cols 인자)
+#   - SSM  : 커널이 부모 슬롯의 상태를 재적재 (tree_parent_indices 인자)
+# 둘 다 대체가 아니라 수정이라 사슬에서 비트 단위로 동일하다.
+# --------------------------------------------------------------------------
+_DDTREE_GDN_PROVIDER = None
+
+
+def set_ddtree_gdn_provider(fn) -> None:
+    """fn(n_spec_reqs, T) -> {"parents","keys","tree_cols"} | None"""
+    global _DDTREE_GDN_PROVIDER
+    _DDTREE_GDN_PROVIDER = fn
+
+
+def _ddtree_gdn(n_spec_reqs: int, T: int, width: int = 4):
+    if _DDTREE_GDN_PROVIDER is None:
+        return None
+    return _DDTREE_GDN_PROVIDER(n_spec_reqs, T, width)
+
 MAX_FUSED_GDN_MTP_TOKENS = 8
 FUSED_GDN_STATE_DTYPES = (torch.float32, torch.bfloat16)
 
@@ -1331,6 +1354,18 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         if spec_sequence_masks is not None:
             # spec_state_indices_tensor is always set when spec_sequence_masks is set
             assert spec_state_indices_tensor is not None
+            _n_spec = attn_metadata.num_spec_decodes  # type: ignore[attr-defined]
+            _T = mixed_qkv_spec.shape[0] // max(1, _n_spec)
+            _info = _ddtree_gdn(_n_spec, _T, conv_weights.shape[-1])
+            self._ddtree_info = _info
+            if _info is not None:
+                from ddtree_gdn import register_state
+
+                register_state(
+                    id(self), conv_state, ssm_state,
+                    spec_state_indices_tensor[:_n_spec].tolist(),
+                    conv_weights.shape[-1], _info["keys"],
+                )
             mixed_qkv_spec = causal_conv1d_update(
                 mixed_qkv_spec,
                 conv_state,
@@ -1341,6 +1376,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     : attn_metadata.num_spec_decodes  # type: ignore[attr-defined]
                 ],
                 num_accepted_tokens=num_accepted_tokens,
+                # DDTree: 있으면 커널이 윈도를 조상 열에서 읽는다
+                tree_cols=None if _info is None else _info["tree_cols"],
                 query_start_loc=spec_query_start_loc,
                 max_query_len=spec_state_indices_tensor.size(-1),
                 validate_data=False,
@@ -1460,6 +1497,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     ],
                     ssm_state_indices=spec_state_indices_tensor,
                     num_accepted_tokens=num_accepted_tokens,
+                    # DDTree: conv 와 '같은' _info 를 써서 둘이 어긋나지 않게 한다
+                    tree_parent_indices=(
+                        self._ddtree_info["parents"]
+                        if getattr(self, "_ddtree_info", None) is not None
+                        else None
+                    ),
                     use_qk_l2norm_in_kernel=True,
                 )
             )
