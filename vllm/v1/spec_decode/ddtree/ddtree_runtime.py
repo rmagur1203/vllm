@@ -23,7 +23,8 @@ import time
 import numpy as np
 import torch
 
-from ddtree_tree import Tree, build_tree, build_tree_from_logits, follow_tree
+from ddtree_tree import (Tree, build_tree, build_tree_from_logits, follow_tree,
+                         shape_and_build)
 import ddtree_compact as compact_mod
 
 
@@ -40,6 +41,13 @@ class DDTreeRuntime:
         self.topk_cap = topk_cap   # 1 이면 분기 없음(순수 사슬) — 디버깅용
         import os as _os
         self.compact_impl = _os.environ.get("VLLM_DDTREE_COMPACT", "triton")
+        self.spine = _os.environ.get("VLLM_DDTREE_SPINE") == "1"
+        self.depth_bonus = float(_os.environ.get("VLLM_DDTREE_BETA", "0"))
+        _tau = _os.environ.get("VLLM_DDTREE_TAU")
+        self.dynamic_tau = float(_tau) if _tau else None
+        # 확신 시 예산 전부를 깊이에 쏟는다. 트리가 예산보다 짧아질 수 있어
+        # 스텝의 드래프트 폭이 줄어든다 — 요청이 하나일 때만 켠다(아래 참조).
+        self.true_chain = _os.environ.get("VLLM_DDTREE_TRUECHAIN") == "1"
         self.depth_cap = 1 << 30   # 드래프터 깊이를 잘라 얕은 트리만 만든다 — 디버깅용
         self.no_accept = False     # True 면 절대 수용 안 함 — 배선 격리용
         self.no_mask = False       # True 면 마스크 자체를 안 준다 — 이분법용
@@ -86,9 +94,18 @@ class DDTreeRuntime:
                 self.pending.pop(req_id, None)
                 out.append([])
                 continue
-            tree = build_tree(lp, ids, self.budget)
-            if tree.num_nodes - 1 != self.budget:
-                # 트리가 예산을 못 채우면 vLLM 이 기대하는 드래프트 길이와 어긋난다.
+            # 🔴 예전에는 build_tree 를 직접 불러 spine/depth_bonus/dynamic_tau
+            #    손잡이가 전부 무시됐다. DFlash 경로와 같은 모양 결정을 쓴다.
+            _short = self.true_chain and self.dynamic_tau is not None and len(req_ids) == 1
+            tree = shape_and_build(
+                lp, ids, self.budget, topk=self.topk_cap, spine=self.spine,
+                depth_bonus=self.depth_bonus, dynamic_tau=self.dynamic_tau,
+                allow_short=_short, pad_to_budget=not _short,
+            )
+            _n = tree.num_nodes - 1
+            # ngram 경로는 list[list[int]] 을 돌려주므로 요청마다 길이가 달라도 된다.
+            # 짧은 드래프트를 허용하지 않을 때만 예산과 일치해야 한다.
+            if _n < 1 or (not _short and _n != self.budget):
                 self.pending.pop(req_id, None)
                 out.append([])
                 continue
@@ -116,16 +133,30 @@ class DDTreeRuntime:
         vocab = logits.shape[-1]
         lg = logits.view(-1, drafter_k, vocab)
         n = len(req_ids)
-        out = np.zeros((n, self.budget), dtype=np.int64)
+        # 🔴 짧은 드래프트는 요청이 하나일 때만 허용한다. 한 스텝의 드래프트 폭은
+        #    텐서 하나로 모든 요청이 공유하므로, 요청마다 트리 크기가 다르면
+        #    짧은 쪽을 늘려야 하고 그러면 모양이 뒤틀린다.
+        _short_ok = self.true_chain and self.dynamic_tau is not None and n == 1
+        trees: dict = {}
         for i, req_id in enumerate(req_ids):
             if i >= lg.shape[0]:
                 self.pending.pop(req_id, None)
                 continue
             _lg = lg[i][: self.depth_cap]
             tree = build_tree_from_logits(
-                _lg, self.budget, topk_cap=self.topk_cap
+                _lg, self.budget, topk_cap=self.topk_cap, spine=self.spine,
+                depth_bonus=self.depth_bonus, dynamic_tau=self.dynamic_tau,
+                allow_short=_short_ok,
             )
-            if tree.num_nodes - 1 != self.budget:
+            trees[i] = tree
+        width = max((t.num_nodes - 1 for t in trees.values()), default=self.budget)
+        width = max(1, min(width, self.budget))
+        out = np.zeros((n, width), dtype=np.int64)
+        for i, req_id in enumerate(req_ids):
+            tree = trees.get(i)
+            if tree is None:
+                continue
+            if tree.num_nodes - 1 != width:
                 # 이 스텝의 드래프트 폭과 트리 크기가 어긋나면 GDN 계층이 트리
                 # 정보를 못 받고 8토큰 상한이 있는 원본 커널로 떨어져 죽는다.
                 # 요청이 여럿이고 크기가 다를 때만 발생한다 (단일 요청이면 width
@@ -273,8 +304,12 @@ class DDTreeRuntime:
         kvs = [int(x) for x in kv_lens_cpu.tolist()]
         assert len(kvs) == len(qs) - 1, f"세그먼트 불일치 {len(kvs)} vs {len(qs)-1}"
 
-        width = self.budget + 1
-        tree_segs = [j for j in range(len(kvs)) if qs[j + 1] - qs[j] == width]
+        # 🔴 예전에는 기대 폭을 budget+1 로 고정했는데, 진짜 사슬 모드는 예산보다
+        #    짧은 드래프트를 낸다. 그러면 세그먼트가 하나도 안 잡혀 전부 causal 로
+        #    물러서고, 트리가 통째로 버려진다 (실측: dropped=158/182, 반복
+        #    프롬프트 641 → 51 tok/s). 실제 트리 크기로 맞춘다.
+        widths = {t.num_nodes for _, t in self.step}
+        tree_segs = [j for j in range(len(kvs)) if (qs[j + 1] - qs[j]) in widths]
         pairing = {}
         if len(tree_segs) == len(self.step):
             pairing = {j: t for j, (_, t) in zip(tree_segs, self.step)}
