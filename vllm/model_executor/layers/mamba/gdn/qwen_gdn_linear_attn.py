@@ -1754,6 +1754,18 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         conv_weights = self.conv1d.weight.view(
             self.conv1d.weight.size(0), self.conv1d.weight.size(2)
         )
+        # --- DDTree: 융합 경로에서도 트리 정보를 세운다 (conv + SSM 이 같은 _info) ---
+        _T = num_actual_tokens // max(1, num_requests)
+        _info = _ddtree_gdn(num_requests, _T, conv_weights.shape[-1])
+        self._ddtree_info = _info
+        if _info is not None:
+            from ddtree_gdn import register_state
+
+            register_state(
+                id(self), conv_state, self.kv_cache[1],
+                state_indices[:num_requests].tolist(),
+                conv_weights.shape[-1], _info["keys"],
+            )
         mixed_qkv = causal_conv1d_update(
             mixed_qkv[:num_actual_tokens],
             conv_state,
@@ -1762,6 +1774,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.activation,
             conv_state_indices=state_indices[:num_requests, 0],
             num_accepted_tokens=num_accepted_tokens[:num_requests],
+            tree_cols=None if _info is None else _info["tree_cols"],
             query_start_loc=cu_seqlens[: num_requests + 1],
             max_query_len=state_indices.size(1),
             validate_data=False,
@@ -1792,6 +1805,29 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         assert num_accepted_tokens is not None
 
         num_requests = attn_metadata.num_spec_decodes
+
+        # --- DDTree: 트리면 8토큰 상한 없는 우리 CUDA 커널로 ---
+        _info = getattr(self, "_ddtree_info", None)
+        if _info is not None:
+            import sys as _sys
+            if "/work/cuda" not in _sys.path:
+                _sys.path.insert(0, "/work/cuda")
+            from ddtree_ext import get_ext
+
+            _ext = get_ext()
+            if _ext is not None:
+                _ext.gdn_decode_tree_mtp(
+                    mixed_qkv, a, b, self.A_log, self.dt_bias,
+                    state_indices[:num_requests].contiguous(),
+                    cu_seqlens[: num_requests + 1].contiguous(),
+                    num_accepted_tokens[:num_requests].contiguous(),
+                    _info["parents"].contiguous(),
+                    self.kv_cache[1], output_gate, self.norm.weight,
+                    core_attn_out, self.head_k_dim**-0.5,
+                    self.layer_norm_epsilon,
+                )
+                return
+
         ops.fused_gdn_decode_post_conv_mtp(
             mixed_qkv=mixed_qkv,
             a=a,
@@ -1854,7 +1890,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and self.num_v_heads % self.num_k_heads == 0
             and self.num_v_heads // self.num_k_heads in (1, 2, 3, 4, 8)
             and state_indices is not None
-            and state_indices.size(1) <= MAX_FUSED_GDN_MTP_TOKENS
+            # 🔴 DDTree: 우리 커널은 8토큰 상한이 없다 (공유메모리에서 shared_state 를
+            #    제거하고 토큰 축을 타일링했다). 트리 공급자가 등록돼 있으면 상한을 푼다.
+            #    원본 커널은 여전히 8 초과를 거부하므로, 트리가 아닐 때는 그대로 둔다.
+            and (
+                state_indices.size(1) <= MAX_FUSED_GDN_MTP_TOKENS
+                or _DDTREE_GDN_PROVIDER is not None
+            )
             and hasattr(torch.ops._C, "fused_gdn_decode_post_conv_mtp")
         )
 
