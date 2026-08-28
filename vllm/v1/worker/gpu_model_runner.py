@@ -612,6 +612,42 @@ class GPUModelRunner(
         # self.model: nn.Module  # Set after load_model
         # Initialize in initialize_kv_cache
         self.kv_caches: list[torch.Tensor] = []
+
+        # --- DDTree (VLLM_DDTREE_BUDGET 로 켠다) ---
+        self.ddtree = None
+        import os as _os
+        _ddt = int(_os.environ.get("VLLM_DDTREE_BUDGET", "0"))
+        if _ddt > 0:
+            import sys as _sys
+            if "/work" not in _sys.path:
+                _sys.path.insert(0, "/work")
+            from ddtree_runtime import DDTreeRuntime
+            from vllm.v1.attention.backends import flashinfer as _fi
+            self.ddtree = DDTreeRuntime(
+                budget=_ddt,
+                depth_limit=int(_os.environ.get("VLLM_DDTREE_DEPTH", "8")),
+                topk_cap=int(_os.environ.get("VLLM_DDTREE_TOPK", "64")),
+                device=self.device,
+            )
+            self.ddtree.no_accept = _os.environ.get("VLLM_DDTREE_NOACCEPT") == "1"
+            self.ddtree.no_mask = _os.environ.get("VLLM_DDTREE_NOMASK") == "1"
+            self.ddtree.depth_cap = int(_os.environ.get("VLLM_DDTREE_DEPTHCAP", str(1 << 30)))
+            # dflash 드래프터가 있으면 그걸 쓰고, 없으면 테스트용 ngram 트리
+            self.ddtree.use_ngram_drafter = (
+                self.speculative_config is None
+                or self.speculative_config.method != "dflash"
+            )
+            _fi.set_ddtree_mask_provider(self.ddtree.mask_provider)
+            # 하이브리드 타깃이면 GDN 재귀 계층에도 트리 부모 배열을 공급한다
+            try:
+                from vllm.model_executor.layers.mamba.gdn import (
+                    qwen_gdn_linear_attn as _gdn,
+                )
+
+                _gdn.set_ddtree_gdn_provider(self.ddtree.gdn_info)
+            except Exception as _e:  # 순수 어텐션 모델이면 해당 없음
+                logger.info("DDTree: GDN 훅 미등록 (%s)", _e)
+            logger.info("DDTree 활성: budget=%d depth=%d", _ddt, self.ddtree.depth_limit)
         # indexes: [kv_cache_group_id][attn_group]
         self.attn_groups: list[list[AttentionGroup]] = []
         # self.kv_cache_config: KVCacheConfig
@@ -2202,6 +2238,22 @@ class GPUModelRunner(
             self.positions[:total_num_scheduled_tokens],
         )
 
+        # --- DDTree: 이번 스텝에 어느 요청이 트리를 갖는지 확정 ---
+        if self.ddtree is not None:
+            self.ddtree.begin_step(
+                self.input_batch.req_ids,
+                num_reqs,
+                scheduler_output.scheduled_spec_decode_tokens,
+                self.input_batch.num_computed_tokens_cpu,
+                self.query_start_loc.np,
+            )
+            # 🔴 하이브리드는 KV 캐시 그룹이 여러 개다 (어텐션 / Mamba).
+            #    그룹마다 slot_mapping·block_size 가 다르므로 전부 넘긴다.
+            self.ddtree.groups = [
+                (bt.slot_mapping.gpu, bt.block_size)
+                for bt in self.input_batch.block_table.block_tables
+            ]
+
         # Copy the tensors to the GPU.
         self._prepare_input_ids(
             scheduler_output,
@@ -3669,6 +3721,12 @@ class GPUModelRunner(
             positions = self.positions[:num_input_tokens]
             if num_input_tokens > num_scheduled_tokens:
                 self.positions[num_scheduled_tokens:num_input_tokens].zero_()
+            # --- DDTree: 형제 노드는 같은 위치를 갖는다. slot_mapping 은
+            #     이미 연속 self.positions 로 계산했으므로 건드리지 않는다. ---
+            if self.ddtree is not None and self.ddtree.active:
+                _rp = self.ddtree.rope_positions(self.positions, num_input_tokens)
+                if _rp is not None:
+                    positions = _rp
 
         if is_first_rank:
             intermediate_tensors = None
@@ -3717,6 +3775,12 @@ class GPUModelRunner(
         if self.use_async_scheduling and self._draft_token_req_ids is not None:
             draft_token_ids_cpu, _ = self._get_draft_token_ids_cpu()
             self.input_batch.update_async_spec_token_ids(draft_token_ids_cpu)
+
+        # --- DDTree: 트리 워크로 검증하고 수용 경로 KV 를 앞으로 당긴다 ---
+        if self.ddtree is not None and self.ddtree.active:
+            _tok, _paths = self.ddtree.accept(logits, spec_decode_metadata)
+            self.ddtree.compact(self.kv_caches, _paths)
+            return SamplerOutput(sampled_token_ids=_tok, logprobs_tensors=None)
 
         draft_probs = self._get_spec_decode_draft_probs(spec_decode_metadata)
         sampler_output = self.rejection_sampler(
@@ -5069,6 +5133,43 @@ class GPUModelRunner(
         common_attn_metadata: CommonAttentionMetadata,
         slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None,
     ) -> list[list[int]] | torch.Tensor:
+        # --- DDTree: 체인 드래프터 대신 트리를 만든다.
+        #     노드 토큰을 힙 순서 평탄 리스트로 돌려주면 vLLM 은 평범한
+        #     드래프트로 알고 다음 스텝에 연속 위치로 스케줄한다. ---
+        if self.ddtree is not None:
+            # 드래프터 forward 동안은 트리 마스크/부모배열을 내주지 않는다
+            self.ddtree.in_drafter = True
+        try:
+            return self._propose_draft_token_ids_inner(
+                scheduler_output, sampled_token_ids, sampling_metadata,
+                hidden_states, sample_hidden_states, aux_hidden_states,
+                spec_decode_metadata, common_attn_metadata, slot_mappings,
+            )
+        finally:
+            if self.ddtree is not None:
+                self.ddtree.in_drafter = False
+
+    def _propose_draft_token_ids_inner(
+        self,
+        scheduler_output: "SchedulerOutput",
+        sampled_token_ids: torch.Tensor | list[list[int]],
+        sampling_metadata: SamplingMetadata,
+        hidden_states: torch.Tensor,
+        sample_hidden_states: torch.Tensor,
+        aux_hidden_states: list[torch.Tensor] | None,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+        common_attn_metadata: CommonAttentionMetadata,
+        slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None,
+    ) -> list[list[int]] | torch.Tensor:
+        if self.ddtree is not None and self.ddtree.use_ngram_drafter:
+            assert isinstance(sampled_token_ids, list)
+            return self.ddtree.propose(
+                self.input_batch.req_ids,
+                self.input_batch.token_ids_cpu,
+                self.input_batch.num_tokens_no_spec,
+                sampled_token_ids,
+            )
+
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         spec_config = self.speculative_config
         assert spec_config is not None
