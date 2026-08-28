@@ -62,10 +62,14 @@ class DDTreeRuntime:
         self._dbg = open(self.debug, "w", buffering=1) if self.debug else None  # 줄 단위 flush
         self.stats = {"steps": 0, "tree_steps": 0, "accepted": 0, "nodes": 0, "dropped": 0,
                       "masked": 0, "ambiguous": 0, "rope_skipped": 0,
-                      "kv_groups": 0, "kv_rows": 0}
+                      "gdn_compact_err": None,
+                      "gdn_calls": 0, "gdn_tree": 0, "gdn_no_step": 0,
+                      "gdn_nreq_mismatch": 0, "gdn_T_mismatch": 0,
+                      "gdn_par_none": 0, "gdn_last": None,
+                      "gdn_cmp": None, "kv_groups": 0, "kv_rows": 0}
         # 구간별 누적 시간(초) — 병목을 숫자로 본다
         self.t = {"propose": 0.0, "mask": 0.0, "accept": 0.0,
-                  "kv_compact": 0.0, "rope": 0.0}
+                  "kv_compact": 0.0, "gdn_compact": 0.0, "rope": 0.0}
         global LAST
         LAST = self
 
@@ -300,6 +304,54 @@ class DDTreeRuntime:
         return _r
 
     # ---- GDN(재귀 계층)용 ----
+    def gdn_info(self, n_spec_reqs: int, T: int, width: int = 4):
+        """GDN 계층용 묶음. 못 맞추면 None → 전부 사슬로 물러선다."""
+        if self.in_drafter:
+            return None
+        self.stats["gdn_calls"] += 1
+        if not self.step:
+            self.stats["gdn_no_step"] += 1
+            return None
+        if len(self.step) != n_spec_reqs:
+            self.stats["gdn_nreq_mismatch"] += 1
+            self.stats["gdn_last"] = f"nreq {len(self.step)} vs {n_spec_reqs}"
+            return None
+        want = self.step[0][1].num_nodes
+        if want != T:
+            self.stats["gdn_T_mismatch"] += 1
+            self.stats["gdn_last"] = f"T {want} vs {T}"
+            return None
+        par = self.tree_parents_tensor(n_spec_reqs, T)
+        if par is None:
+            self.stats["gdn_par_none"] += 1
+            return None
+        self.stats["gdn_tree"] += 1
+        from ddtree_gdn import tree_cols_tensor
+        return {
+            "tree_cols": tree_cols_tensor(
+                [t for _, t in self.step], width, self.device
+            ),
+            "parents": par,
+            "keys": list(self.step_req_ids),
+        }
+
+    def tree_parents_tensor(self, n_spec_reqs: int, T: int):
+        """[n_spec_reqs, T] int32 부모 배열. 루트는 -1. 못 맞추면 None.
+
+        하이브리드 타깃의 GDN 계층이 쓴다 — SSM 은 부모 슬롯에서 상태를 재적재하고
+        conv 는 윈도를 조상에서 gather 한다 (ddtree_gdn.py 참조).
+
+        🔴 스펙 요청 수와 트리 수가 다르면 None 을 돌려 전부 사슬로 물러선다.
+           재귀 계층만 트리이고 어텐션이 아니거나 그 반대면 출력이 깨진다.
+        """
+        if not self.step or len(self.step) != n_spec_reqs:
+            return None
+        rows = []
+        for _, tree in self.step:
+            if tree.num_nodes != T:
+                return None
+            rows.append(tree.parents)          # parents[0] == -1
+        return torch.tensor(rows, dtype=torch.int32, device=self.device)
 
     # ------------------------------------------------------------------ 5
     def accept(self, logits: torch.Tensor, spec_md):
@@ -376,6 +428,17 @@ class DDTreeRuntime:
            (block_size=1024) 그 결과 어텐션 캐시가 필터에 전부 걸러져
            **컴팩션이 아예 일어나지 않았다** (2026-08-27 실측).
         """
+        # --- GDN(재귀 계층) 상태를 사슬처럼 재배치 ---
+        _t0 = time.perf_counter()
+        try:
+            import ddtree_gdn
+            ddtree_gdn.compact_gdn(
+                {self.all_req_ids[i]: acc for i, acc in paths.items()}
+            )
+            self.stats["gdn_cmp"] = dict(ddtree_gdn.COMPACT_STATS)
+        except Exception as _e:
+            self.stats["gdn_compact_err"] = repr(_e)[:80]
+        self.t["gdn_compact"] += time.perf_counter() - _t0
 
         _t0 = time.perf_counter()
         if not paths:

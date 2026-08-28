@@ -18,6 +18,9 @@ from vllm.triton_utils import tl, triton
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
         "IS_CONTINUOUS_BATCHING": lambda args: args["ssm_state_indices"] is not None,
         "IS_SPEC_DECODING": lambda args: args["num_accepted_tokens"] is not None,
+        # DDTree: 트리 부모 인덱스가 주어지면 상태를 부모 슬롯에서 재적재한다
+        "IS_TREE": lambda args: args["tree_parent_indices"] is not None,
+        "HAS_TREE_INIT": lambda args: args["tree_init_index"] is not None,
     }
 )
 @triton.jit(do_not_specialize=["N", "T"])
@@ -37,6 +40,8 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     cu_seqlens,
     ssm_state_indices,
     num_accepted_tokens,
+    tree_parent_indices,   # DDTree: [N, T] int32, 노드별 부모 (루트는 -1)
+    tree_init_index,       # DDTree: [N] int32, 직전 스텝 수용 경로의 마지막 노드
     scale,
     N: tl.int64,  # num of sequences
     T: tl.int64,  # num of tokens
@@ -57,6 +62,8 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     IS_VARLEN: tl.constexpr,
     IS_CONTINUOUS_BATCHING: tl.constexpr,
     IS_SPEC_DECODING: tl.constexpr,
+    IS_TREE: tl.constexpr,
+    HAS_TREE_INIT: tl.constexpr,
     IS_KDA: tl.constexpr,
 ):
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
@@ -103,7 +110,14 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     if USE_INITIAL_STATE:
         if IS_CONTINUOUS_BATCHING:
             if IS_SPEC_DECODING:
-                i_t = tl.load(num_accepted_tokens + i_n).to(tl.int64) - 1
+                # 🔴 사슬에서는 '수용 개수-1' 이 마지막 수용 토큰의 인덱스지만
+                #    트리에서는 아니다. 수용 경로가 [0,2,5,9] 면 마지막은 9 인데
+                #    num_accepted-1 은 3 이다 → 엉뚱한 노드 상태에서 출발한다.
+                #    IS_TREE 면 직전 스텝의 실제 마지막 노드 인덱스를 쓴다.
+                if IS_TREE and HAS_TREE_INIT:
+                    i_t = tl.load(tree_init_index + i_n).to(tl.int64)
+                else:
+                    i_t = tl.load(num_accepted_tokens + i_n).to(tl.int64) - 1
             else:
                 i_t = 0
             # Load state index and check for invalid entries
@@ -120,6 +134,22 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
     for i_t in range(0, T):
+        # ---- DDTree: 트리 모드에서는 '직전 토큰'이 아니라 '부모 노드'의 상태에서 출발한다.
+        #      노드는 힙 순서라 parent(i) < i 가 보장되므로, 이 루프에서 이미
+        #      저장된 슬롯이다 (아래 INPLACE_FINAL_STATE 저장부).
+        #      루트(parent < 0)는 재적재하지 않고 초기 상태를 그대로 쓴다.
+        if IS_TREE:
+            i_par = tl.load(tree_parent_indices + i_n * T + i_t).to(tl.int64)
+            if i_par >= 0:
+                tl.debug_barrier()   # 같은 프로그램의 앞선 store 가 보이도록
+                par_idx = tl.load(
+                    ssm_state_indices + i_n * stride_indices_seq + i_par
+                ).to(tl.int64)
+                if par_idx > 0:
+                    p_hp = ht + par_idx * stride_final_state_token
+                    p_hp = p_hp + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
+                    b_h = tl.load(p_hp, mask=mask_h, other=0).to(tl.float32)
+
         b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
         b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
         b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
@@ -194,6 +224,8 @@ def fused_sigmoid_gating_delta_rule_update(
     cu_seqlens: torch.Tensor | None = None,
     ssm_state_indices: torch.Tensor | None = None,
     num_accepted_tokens: torch.Tensor | None = None,
+    tree_parent_indices: torch.Tensor | None = None,   # DDTree
+    tree_init_index: torch.Tensor | None = None,       # DDTree
     use_qk_l2norm_in_kernel: bool = False,
     is_kda: bool = False,
 ):
@@ -255,6 +287,8 @@ def fused_sigmoid_gating_delta_rule_update(
         cu_seqlens=cu_seqlens,
         ssm_state_indices=ssm_state_indices,
         num_accepted_tokens=num_accepted_tokens,
+        tree_parent_indices=tree_parent_indices,
+        tree_init_index=tree_init_index,
         scale=scale,
         N=N,
         T=T,

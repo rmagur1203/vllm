@@ -768,6 +768,7 @@ def _causal_conv1d_update_kernel(
     conv_state_ptr,
     conv_state_indices_ptr,
     num_accepted_tokens_ptr,
+    tree_cols_ptr,  # DDTree: (batch, seqlen, KERNEL_WIDTH-1) int32, 절대열
     query_start_loc_ptr,  # (batch + 1)
     block_idx_last_scheduled_token,  # (batch,)
     initial_state_idx,  # (batch,)
@@ -800,6 +801,7 @@ def _causal_conv1d_update_kernel(
     IS_VARLEN: tl.constexpr,
     IS_APC_ENABLED: tl.constexpr,
     IS_SPEC_DECODING: tl.constexpr,
+    IS_TREE: tl.constexpr,
     NP2_STATELEN: tl.constexpr,
     HAS_NULL_BLOCK: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -992,6 +994,22 @@ def _causal_conv1d_update_kernel(
     x_base_1d = x_base  # starting of chunk [BLOCK_N]
     mask_x_1d = idx_feats < dim
 
+    # 🔴 DDTree: 히스토리는 '레지스터 스냅샷' 에서 온다.
+    #    STEP 2 가 새 상태를 소스와 같은 블록에 덮어쓸 수 있어, 루프 안에서
+    #    conv_state 를 다시 읽으면 이미 밀려난 값을 읽는다.
+    if IS_TREE:
+        tgt_base = (
+            conv_state_ptr
+            + (conv_states_offset * stride_conv_state_seq)
+            + (idx_feats * stride_conv_state_dim)
+        )
+        if KERNEL_WIDTH >= 2:
+            th0 = col0
+        if KERNEL_WIDTH >= 3:
+            th1 = col1
+        if KERNEL_WIDTH >= 4:
+            th2 = col2
+
     # STEP 5: compute each token
     if launch_pdl:
         tl.extra.cuda.gdc_launch_dependents()
@@ -999,88 +1017,158 @@ def _causal_conv1d_update_kernel(
     for idx_token in tl.range(seqlen):
         acc = acc_preload
 
-        matrix_w = w_col0
-        matrix_x = col0
-        for j in tl.static_range(KERNEL_WIDTH):
+        if IS_TREE:
+            # ---- DDTree: 윈도를 '조상' 에서 가져와 직접 누적한다 ----
+            #  절대열 tc: 0..W-2 → 이전 히스토리(레지스터), W-1+i → 이번 스텝 노드 i
+            #  🔴 루프 반송 레지스터 col0..col2 에 대입하면 시프트와 충돌한다.
+            #  곱셈-누적 순서(w0,w1,...)는 원본과 동일 → 사슬은 비트 단위 동일해야 한다.
+            tcb = tree_cols_ptr + (idx_seq * seqlen + idx_token) * (KERNEL_WIDTH - 1)
+            if KERNEL_WIDTH >= 2:
+                tc = tl.load(tcb + 0).to(tl.int32)
+                hv = th0
+                if KERNEL_WIDTH >= 3:
+                    hv = tl.where(tc == 1, th1, hv)
+                if KERNEL_WIDTH >= 4:
+                    hv = tl.where(tc == 2, th2, hv)
+                # 🔴 노드 값은 x 에서 읽으면 안 된다 — causal_conv1d_update 는
+                #    out is None 이면 out = x 로 '제자리' 출력한다(:1237).
+                #    앞선 토큰의 출력이 x 를 덮어써서, 조상 토큰을 읽으면 결과값이 나온다.
+                #    (실측: x 인덱스 < idx_token 이면 전부 오답)
+                #    STEP 2 가 타깃 블록에 [히스토리|노드값] 을 이미 저장해 두었으므로
+                #    노드 i 는 열 (state_len - seqlen + i) 에서 읽는다.
+                nv = tl.load(
+                    tgt_base + (state_len - seqlen + tc - (KERNEL_WIDTH - 1))
+                    * stride_conv_state_tok,
+                    mask_w & (tc >= KERNEL_WIDTH - 1), 0.0,
+                )
+                acc += tl.where(tc >= KERNEL_WIDTH - 1, nv, hv) * w_col0
+            if KERNEL_WIDTH >= 3:
+                tc = tl.load(tcb + 1).to(tl.int32)
+                hv = th0
+                if KERNEL_WIDTH >= 3:
+                    hv = tl.where(tc == 1, th1, hv)
+                if KERNEL_WIDTH >= 4:
+                    hv = tl.where(tc == 2, th2, hv)
+                # 🔴 노드 값은 x 에서 읽으면 안 된다 — causal_conv1d_update 는
+                #    out is None 이면 out = x 로 '제자리' 출력한다(:1237).
+                #    앞선 토큰의 출력이 x 를 덮어써서, 조상 토큰을 읽으면 결과값이 나온다.
+                #    (실측: x 인덱스 < idx_token 이면 전부 오답)
+                #    STEP 2 가 타깃 블록에 [히스토리|노드값] 을 이미 저장해 두었으므로
+                #    노드 i 는 열 (state_len - seqlen + i) 에서 읽는다.
+                nv = tl.load(
+                    tgt_base + (state_len - seqlen + tc - (KERNEL_WIDTH - 1))
+                    * stride_conv_state_tok,
+                    mask_w & (tc >= KERNEL_WIDTH - 1), 0.0,
+                )
+                acc += tl.where(tc >= KERNEL_WIDTH - 1, nv, hv) * w_col1
+            if KERNEL_WIDTH >= 4:
+                tc = tl.load(tcb + 2).to(tl.int32)
+                hv = th0
+                if KERNEL_WIDTH >= 3:
+                    hv = tl.where(tc == 1, th1, hv)
+                if KERNEL_WIDTH >= 4:
+                    hv = tl.where(tc == 2, th2, hv)
+                # 🔴 노드 값은 x 에서 읽으면 안 된다 — causal_conv1d_update 는
+                #    out is None 이면 out = x 로 '제자리' 출력한다(:1237).
+                #    앞선 토큰의 출력이 x 를 덮어써서, 조상 토큰을 읽으면 결과값이 나온다.
+                #    (실측: x 인덱스 < idx_token 이면 전부 오답)
+                #    STEP 2 가 타깃 블록에 [히스토리|노드값] 을 이미 저장해 두었으므로
+                #    노드 i 는 열 (state_len - seqlen + i) 에서 읽는다.
+                nv = tl.load(
+                    tgt_base + (state_len - seqlen + tc - (KERNEL_WIDTH - 1))
+                    * stride_conv_state_tok,
+                    mask_w & (tc >= KERNEL_WIDTH - 1), 0.0,
+                )
+                acc += tl.where(tc >= KERNEL_WIDTH - 1, nv, hv) * w_col2
+            mx = tl.load(x_base_1d + idx_token * stride_x_token, mask=mask_x_1d)
             if KERNEL_WIDTH == 2:
-                if j == 1:  # KERNEL_WIDTH-1:
-                    matrix_w = w_col1
-                    x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
-                    matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
+                acc += mx * w_col1
             elif KERNEL_WIDTH == 3:
-                if j == 1:
-                    matrix_w = w_col1
-                    matrix_x = col1
-                elif j == 2:
-                    matrix_w = w_col2
-                    x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
-                    matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
+                acc += mx * w_col2
             elif KERNEL_WIDTH == 4:
-                if j == 1:
-                    matrix_w = w_col1
-                    matrix_x = col1
-                elif j == 2:
-                    matrix_w = w_col2
-                    matrix_x = col2
-                elif j == 3:
-                    matrix_w = w_col3
-                    x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
-                    matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
+                acc += mx * w_col3
+        if not IS_TREE:
+            matrix_w = w_col0
+            matrix_x = col0
+            for j in tl.static_range(KERNEL_WIDTH):
+                if KERNEL_WIDTH == 2:
+                    if j == 1:  # KERNEL_WIDTH-1:
+                        matrix_w = w_col1
+                        x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
+                        matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
+                elif KERNEL_WIDTH == 3:
+                    if j == 1:
+                        matrix_w = w_col1
+                        matrix_x = col1
+                    elif j == 2:
+                        matrix_w = w_col2
+                        x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
+                        matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
+                elif KERNEL_WIDTH == 4:
+                    if j == 1:
+                        matrix_w = w_col1
+                        matrix_x = col1
+                    elif j == 2:
+                        matrix_w = w_col2
+                        matrix_x = col2
+                    elif j == 3:
+                        matrix_w = w_col3
+                        x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
+                        matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
+                elif KERNEL_WIDTH == 5:
+                    if j == 1:
+                        matrix_w = w_col1
+                        matrix_x = col1
+                    elif j == 2:
+                        matrix_w = w_col2
+                        matrix_x = col2
+                    elif j == 3:
+                        matrix_w = w_col3
+                        matrix_x = col3
+                    elif j == 4:
+                        matrix_w = w_col4
+                        x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
+                        matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
+                elif KERNEL_WIDTH == 6:
+                    if j == 1:
+                        matrix_w = w_col1
+                        matrix_x = col1
+                    elif j == 2:
+                        matrix_w = w_col2
+                        matrix_x = col2
+                    elif j == 3:
+                        matrix_w = w_col3
+                        matrix_x = col3
+                    elif j == 4:
+                        matrix_w = w_col4
+                        matrix_x = col4
+                    elif j == 5:
+                        matrix_w = w_col5
+                        x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
+                        matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
+
+                acc += matrix_x * matrix_w  # [BLOCK_N]
+
+            if KERNEL_WIDTH == 2:
+                col0 = matrix_x
+            elif KERNEL_WIDTH == 3:
+                col0 = col1
+                col1 = matrix_x
+            elif KERNEL_WIDTH == 4:
+                col0 = col1
+                col1 = col2
+                col2 = matrix_x
             elif KERNEL_WIDTH == 5:
-                if j == 1:
-                    matrix_w = w_col1
-                    matrix_x = col1
-                elif j == 2:
-                    matrix_w = w_col2
-                    matrix_x = col2
-                elif j == 3:
-                    matrix_w = w_col3
-                    matrix_x = col3
-                elif j == 4:
-                    matrix_w = w_col4
-                    x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
-                    matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
+                col0 = col1
+                col1 = col2
+                col2 = col3
+                col3 = matrix_x
             elif KERNEL_WIDTH == 6:
-                if j == 1:
-                    matrix_w = w_col1
-                    matrix_x = col1
-                elif j == 2:
-                    matrix_w = w_col2
-                    matrix_x = col2
-                elif j == 3:
-                    matrix_w = w_col3
-                    matrix_x = col3
-                elif j == 4:
-                    matrix_w = w_col4
-                    matrix_x = col4
-                elif j == 5:
-                    matrix_w = w_col5
-                    x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
-                    matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
-
-            acc += matrix_x * matrix_w  # [BLOCK_N]
-
-        if KERNEL_WIDTH == 2:
-            col0 = matrix_x
-        elif KERNEL_WIDTH == 3:
-            col0 = col1
-            col1 = matrix_x
-        elif KERNEL_WIDTH == 4:
-            col0 = col1
-            col1 = col2
-            col2 = matrix_x
-        elif KERNEL_WIDTH == 5:
-            col0 = col1
-            col1 = col2
-            col2 = col3
-            col3 = matrix_x
-        elif KERNEL_WIDTH == 6:
-            col0 = col1
-            col1 = col2
-            col2 = col3
-            col3 = col4
-            col4 = matrix_x
-
+                col0 = col1
+                col1 = col2
+                col2 = col3
+                col3 = col4
+                col4 = matrix_x
         if SILU_ACTIVATION:
             acc = acc / (1 + tl.exp(-acc))
         mask_1d = (idx_token < seqlen) & (
@@ -1101,6 +1189,7 @@ def causal_conv1d_update(
     activation: bool | str | None = None,
     conv_state_indices: torch.Tensor | None = None,
     num_accepted_tokens: torch.Tensor | None = None,
+    tree_cols: torch.Tensor | None = None,   # DDTree: (batch, seqlen, W-1) 절대열
     query_start_loc: torch.Tensor | None = None,
     max_query_len: int = -1,
     null_block_id: int = NULL_BLOCK_ID,
@@ -1237,6 +1326,7 @@ def causal_conv1d_update(
         conv_state,
         conv_state_indices,
         num_accepted_tokens,
+        tree_cols,
         query_start_loc,
         block_idx_last_scheduled_token,
         initial_state_idx,
@@ -1269,6 +1359,7 @@ def causal_conv1d_update(
         IS_VARLEN=query_start_loc is not None,
         IS_APC_ENABLED=block_idx_last_scheduled_token is not None,
         IS_SPEC_DECODING=num_accepted_tokens is not None,
+        IS_TREE=tree_cols is not None,
         NP2_STATELEN=np2_statelen,
         HAS_NULL_BLOCK=null_block_id is not None,
         BLOCK_N=256,
