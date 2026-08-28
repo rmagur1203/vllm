@@ -22,8 +22,7 @@ _ns = {
 exec(compile(ast.Module(body=[_fn], type_ignores=[]), "<ref>", "exec"), _ns)
 ref_build = _ns["build_ddtree_tree"]
 
-sys.path.insert(0, "/work")
-from ddtree_tree import build_tree_from_logits         # 우리 것
+from vllm.v1.spec_decode.ddtree.tree import build_tree_from_logits         # 우리 것
 
 CASES = [
     # (depth_limit, vocab, budget, seed)

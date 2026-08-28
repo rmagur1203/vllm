@@ -4,8 +4,7 @@ compact_gdn 은 '노드 i 의 값이 열 base+i 에 있다' 고 가정하고 열
 그 가정이 맞는지 직접 본다.
 """
 import sys, numpy as np, torch
-sys.path.insert(0, "/work")
-from ddtree_gdn import tree_conv_columns
+from vllm.v1.spec_decode.ddtree.gdn import tree_conv_columns
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_update
 torch.manual_seed(0)
 DEV, DT = "cuda", torch.bfloat16

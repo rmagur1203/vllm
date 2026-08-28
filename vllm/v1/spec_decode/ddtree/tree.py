@@ -120,6 +120,10 @@ def build_tree_from_logits(draft_logits: torch.Tensor, budget: int,
     log_z = torch.logsumexp(logits, dim=-1, keepdim=True)
     lp = (top_logits - log_z).to(device="cpu", dtype=torch.float32).numpy()
     ids = top_ids.to(device="cpu", dtype=torch.long).numpy()
+    tree = build_tree(lp[:, :topk], ids[:, :topk], budget)
+    if pad_to_budget:
+        pad_tree_to_budget(tree, ids[0], budget)
+    return tree
 
 
 def pad_tree_to_budget(tree: Tree, depth0_ids: np.ndarray, budget: int) -> Tree:

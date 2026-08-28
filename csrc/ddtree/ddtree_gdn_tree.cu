@@ -346,7 +346,14 @@ void gdn_decode_tree_mtp(
   C10_CUDA_CHECK(cudaGetLastError());
 }
 
+// 두 가지 방식으로 노출한다.
+//   1) vLLM 빌드에 편입된 경우: torch.ops._C.ddtree_gdn_decode_tree_mtp
+//      (csrc/torch_bindings.cpp 에서 등록, CMakeLists 의 소스 목록에 추가)
+//   2) 개발 중 JIT 컴파일: torch.utils.cpp_extension.load 가 정의하는
+//      TORCH_EXTENSION_NAME 모듈. VLLM_DDTREE_JIT 로 이 경로를 쓴다.
+#ifdef TORCH_EXTENSION_NAME
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("gdn_decode_tree_mtp", &gdn_decode_tree_mtp,
         "GDN decode MTP post-conv with tree parents (no 8-token cap)");
 }
+#endif

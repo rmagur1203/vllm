@@ -1359,7 +1359,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             _info = _ddtree_gdn(_n_spec, _T, conv_weights.shape[-1])
             self._ddtree_info = _info
             if _info is not None:
-                from ddtree_gdn import register_state
+                from vllm.v1.spec_decode.ddtree.gdn import register_state
 
                 register_state(
                     id(self), conv_state, ssm_state,
@@ -1759,7 +1759,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         _info = _ddtree_gdn(num_requests, _T, conv_weights.shape[-1])
         self._ddtree_info = _info
         if _info is not None:
-            from ddtree_gdn import register_state
+            from vllm.v1.spec_decode.ddtree.gdn import register_state
 
             register_state(
                 id(self), conv_state, self.kv_cache[1],
@@ -1809,10 +1809,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # --- DDTree: 트리면 8토큰 상한 없는 우리 CUDA 커널로 ---
         _info = getattr(self, "_ddtree_info", None)
         if _info is not None:
-            import sys as _sys
-            if "/work/cuda" not in _sys.path:
-                _sys.path.insert(0, "/work/cuda")
-            from ddtree_ext import get_ext
+            from vllm.v1.spec_decode.ddtree.cuda_ext import get_ext
 
             _ext = get_ext()
             if _ext is not None:

@@ -7,8 +7,7 @@
 수식은 ddtree_gdn_tree.cu 의 전처리부(137~175)와 코어(176~262)에서 읽었다.
 """
 import os, sys, torch
-sys.path.insert(0, "/work/cuda")
-from ddtree_ext import get_ext
+from vllm.v1.spec_decode.ddtree.cuda_ext import get_ext
 
 d = torch.load("/work/gdn_mismatch.pt", map_location="cuda")
 mixed, a, b = d["mixed_qkv"], d["a"], d["b"]

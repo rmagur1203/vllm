@@ -68,7 +68,7 @@ if MODE in ("flat", "tree"):
 if __name__ == "__main__":
     llm = LLM(**kw)
 
-    import ddtree_runtime
+    from vllm.v1.spec_decode.ddtree import runtime as ddtree_runtime
     print("DDTREE_ACTIVE:", ddtree_runtime.LAST is not None, flush=True)
     if ddtree_runtime.LAST is not None:
         print("DDTREE_BUDGET:", ddtree_runtime.LAST.budget,
@@ -113,7 +113,7 @@ if __name__ == "__main__":
 
     if MODE == "tree":
         try:
-            import ddtree_runtime
+            from vllm.v1.spec_decode.ddtree import runtime as ddtree_runtime
             if ddtree_runtime.LAST is not None:
                 res["stats"] = dict(ddtree_runtime.LAST.stats)
             if ddtree_runtime.LAST.trace:

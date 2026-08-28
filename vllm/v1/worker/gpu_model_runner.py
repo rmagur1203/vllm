@@ -618,10 +618,7 @@ class GPUModelRunner(
         import os as _os
         _ddt = int(_os.environ.get("VLLM_DDTREE_BUDGET", "0"))
         if _ddt > 0:
-            import sys as _sys
-            if "/work" not in _sys.path:
-                _sys.path.insert(0, "/work")
-            from ddtree_runtime import DDTreeRuntime
+            from vllm.v1.spec_decode.ddtree import DDTreeRuntime
             from vllm.v1.attention.backends import flashinfer as _fi
             self.ddtree = DDTreeRuntime(
                 budget=_ddt,

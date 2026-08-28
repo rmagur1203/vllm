@@ -6,8 +6,7 @@
   3. 경쟁 조건이 실제로 발생하는 배치(src 와 dst 가 겹치는 경우)를 포함
 """
 import sys, torch
-sys.path.insert(0, "/work")
-from ddtree_compact import compact_kv_triton, compact_kv_torch
+from vllm.v1.spec_decode.ddtree.compact import compact_kv_triton, compact_kv_torch
 
 torch.manual_seed(0)
 DEV = "cuda"

@@ -1,6 +1,6 @@
 """패딩된 트리가 여전히 올바른 트리인지 — 인덱스/가시성/추적."""
 import numpy as np, torch
-from ddtree_tree import build_tree_from_logits, follow_tree
+from vllm.v1.spec_decode.ddtree.tree import build_tree_from_logits, follow_tree
 
 torch.manual_seed(0)
 V, DEPTH = 200, 6

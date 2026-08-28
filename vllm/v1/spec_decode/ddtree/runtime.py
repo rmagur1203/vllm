@@ -23,8 +23,8 @@ import time
 import numpy as np
 import torch
 
-from ddtree_tree import Tree, build_tree, build_tree_from_logits, follow_tree
-import ddtree_compact as compact_mod
+from vllm.v1.spec_decode.ddtree.tree import Tree, build_tree, build_tree_from_logits, follow_tree
+from vllm.v1.spec_decode.ddtree import compact as compact_mod
 
 
 LAST = None   # 테스트에서 통계를 읽으려고 마지막 인스턴스를 붙들어 둔다
@@ -328,7 +328,7 @@ class DDTreeRuntime:
             self.stats["gdn_par_none"] += 1
             return None
         self.stats["gdn_tree"] += 1
-        from ddtree_gdn import tree_cols_tensor
+        from vllm.v1.spec_decode.ddtree.gdn import tree_cols_tensor
         return {
             "tree_cols": tree_cols_tensor(
                 [t for _, t in self.step], width, self.device
@@ -433,7 +433,7 @@ class DDTreeRuntime:
         # --- GDN(재귀 계층) 상태를 사슬처럼 재배치 ---
         _t0 = time.perf_counter()
         try:
-            import ddtree_gdn
+            from vllm.v1.spec_decode.ddtree import gdn as ddtree_gdn
             ddtree_gdn.compact_gdn(
                 {self.all_req_ids[i]: acc for i, acc in paths.items()}
             )

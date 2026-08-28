@@ -16,13 +16,13 @@ accepted=1 로 두면 source = row[0] 이고, 토큰0 이 같은 슬롯에 덮�
                   참조 구현 없이 커널만으로 성립한다.
 """
 import torch
-from torch.utils.cpp_extension import load
 
-ext = load(name="ddtree_gdn", sources=["/work/cuda/ddtree_gdn_tree.cu"],
-           build_directory="/work/cuda/build",
-           extra_cuda_cflags=["-O3", "-gencode=arch=compute_86,code=sm_86",
-                              "--expt-relaxed-constexpr"],
-           extra_cflags=["-O3"], verbose=False)
+from vllm.v1.spec_decode.ddtree.cuda_ext import get_ext
+
+ext = get_ext()
+if ext is None:
+    raise SystemExit("GDN 트리 커널 없음 — VLLM_DDTREE_JIT=1 로 JIT 컴파일하거나 "
+                     "빌드에 편입해야 한다")
 
 DEV = "cuda"; H, HV, DK, DV = 2, 4, 128, 128
 ST = torch.float32
