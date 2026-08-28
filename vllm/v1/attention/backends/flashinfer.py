@@ -390,6 +390,45 @@ class BatchDCPPrefillWrapper:
         return out
 
 
+# --------------------------------------------------------------------------
+# DDTree: 트리 어텐션 마스크 주입 지점
+#
+# 스펙 디코딩 프로포저가 스텝마다 ancestor-only 마스크를 공급하면
+# prefill 경로의 plan() 이 그걸 custom_mask 로 넘긴다.
+#
+# 🔴 packed_custom_mask 로 직접 넘기면 안 됩니다.
+#    plan() 의 _compute_page_mask_indptr 은 '원소' 누적합을 만드는데
+#    커널은 '바이트' 오프셋을 기대합니다. 변환은 segment_packbits 가
+#    하는데, packed 를 직접 주면 그 단계를 건너뜁니다 → 배치 1 에서만 맞음.
+#    (2026-08-27 실측: ddtree-dev/t1_treemask.py 변형 B)
+#
+# 🔴 마스크가 있으면 indptr 을 CUDA 로 넘겨야 합니다.
+#    segment_packbits 가 CUDA indptr 을 요구합니다 (CPU 면 RuntimeError).
+# --------------------------------------------------------------------------
+_DDTREE_MASK_PROVIDER = None
+
+
+def set_ddtree_mask_provider(fn) -> None:
+    """fn(qo_indptr_cpu, kv_lens_cpu) -> 1D bool CUDA 텐서 | None
+
+    반환 텐서는 요청별 (q_len x kv_len) bool 을 평탄화해 이어붙인 것.
+    None 을 반환하면 이번 스텝은 기존 causal 경로를 그대로 탄다.
+    """
+    global _DDTREE_MASK_PROVIDER
+    _DDTREE_MASK_PROVIDER = fn
+
+
+def _ddtree_build_mask(qo_indptr_cpu, paged_kv_indptr_cpu, last_page_len_cpu, page_size):
+    """등록된 공급자가 있으면 이번 스텝의 트리 마스크를 만든다."""
+    if _DDTREE_MASK_PROVIDER is None:
+        return None
+    kv_lens = (
+        (paged_kv_indptr_cpu[1:] - paged_kv_indptr_cpu[:-1] - 1) * page_size
+        + last_page_len_cpu
+    )
+    return _DDTREE_MASK_PROVIDER(qo_indptr_cpu, kv_lens)
+
+
 class FlashInferBackend(AttentionBackend):
     @classmethod
     def customize_spec(cls, spec: "AttentionSpec") -> "AttentionSpec":
@@ -665,6 +704,11 @@ class FlashInferMetadata:
     """
 
     cascade_wrapper: MultiLevelCascadeAttentionWrapper | None
+
+    # --- DDTree ---
+    ddtree_mask_active: bool = False
+    """이번 스텝의 prefill plan() 이 트리 마스크로 계획되었는지.
+    True 면 wrapper._causal 은 False 이고 가시성은 마스크가 규정한다."""
 
 
 class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
@@ -1614,16 +1658,37 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     o_dtype = (
                         FP8_DTYPE if self.is_kvcache_nvfp4 else self.model_config.dtype
                     )
+                    # --- DDTree: 트리 마스크가 있으면 custom_mask 로 전달 ---
+                    ddtree_mask = _ddtree_build_mask(
+                        qo_indptr_prefill_cpu,
+                        paged_kv_indptr_prefill_cpu,
+                        paged_kv_last_page_len_prefill_cpu,
+                        self.page_size,
+                    )
+                    if ddtree_mask is None:
+                        _qo_ind = qo_indptr_prefill_cpu
+                        _kv_ind = paged_kv_indptr_prefill_cpu
+                        _lpl = paged_kv_last_page_len_prefill_cpu
+                        _causal = attn_metadata.causal
+                    else:
+                        # segment_packbits 는 CUDA indptr 을 요구한다
+                        _dev = paged_kv_indices.device
+                        _qo_ind = qo_indptr_prefill_cpu.to(_dev)
+                        _kv_ind = paged_kv_indptr_prefill_cpu.to(_dev)
+                        _lpl = paged_kv_last_page_len_prefill_cpu.to(_dev)
+                        # 마스크가 가시성을 전부 규정하므로 causal 은 끈다
+                        _causal = False
                     prefill_wrapper.plan(
-                        qo_indptr=qo_indptr_prefill_cpu,
-                        paged_kv_indptr=paged_kv_indptr_prefill_cpu,
+                        qo_indptr=_qo_ind,
+                        paged_kv_indptr=_kv_ind,
                         paged_kv_indices=paged_kv_indices,
-                        paged_kv_last_page_len=paged_kv_last_page_len_prefill_cpu,
+                        paged_kv_last_page_len=_lpl,
+                        custom_mask=ddtree_mask,
                         num_qo_heads=self.num_qo_heads,
                         num_kv_heads=self.num_kv_heads,
                         head_dim_qk=self.head_dim,
                         page_size=self.page_size,
-                        causal=attn_metadata.causal,
+                        causal=_causal,
                         sm_scale=self.sm_scale,
                         window_left=self.window_left,
                         logits_soft_cap=self.logits_soft_cap,
@@ -1633,6 +1698,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         fixed_split_size=self.prefill_fixed_split_size,
                         disable_split_kv=self.disable_split_kv,
                     )
+                    attn_metadata.ddtree_mask_active = ddtree_mask is not None
                 attn_metadata.prefill = FIPrefill(wrapper=prefill_wrapper)
 
         ## DECODE PATHWAY
@@ -2134,7 +2200,12 @@ class FlashInferImpl(AttentionImpl):
                         self.logits_soft_cap or 0.0
                     )
                     assert prefill_wrapper._sm_scale == self.scale
-                    assert prefill_wrapper._causal == attn_metadata.causal
+                    # DDTree: 트리 마스크를 쓰면 가시성을 마스크가 전부 규정하므로
+                    # plan() 에서 causal=False 로 내려간다. 그 경우는 예외.
+                    assert (
+                        prefill_wrapper._causal == attn_metadata.causal
+                        or attn_metadata.ddtree_mask_active
+                    )
 
                     if self.is_kvcache_nvfp4:
                         kv_cache_for_fi = nvfp4_kv_data
