@@ -23,7 +23,7 @@ import time
 import numpy as np
 import torch
 
-from ddtree_tree import Tree, build_tree, follow_tree
+from ddtree_tree import Tree, build_tree, build_tree_from_logits, follow_tree
 import ddtree_compact as compact_mod
 
 
@@ -43,6 +43,7 @@ class DDTreeRuntime:
         self.depth_cap = 1 << 30   # 드래프터 깊이를 잘라 얕은 트리만 만든다 — 디버깅용
         self.no_accept = False     # True 면 절대 수용 안 함 — 배선 격리용
         self.no_mask = False       # True 면 마스크 자체를 안 준다 — 이분법용
+        self.in_drafter = False    # 드래프터 forward 중에는 트리 마스크를 주면 안 된다
         self.use_ngram_drafter = True   # dflash 드래프터가 없을 때의 테스트 경로
 
         self.pending: dict[str, Tree] = {}          # req_id -> 다음 스텝용 트리
@@ -89,6 +90,48 @@ class DDTreeRuntime:
             self.pending[req_id] = tree
             out.append([int(t) for t in tree.token_ids])
         return out
+
+    def propose_from_drafter_logits(self, req_ids, logits, drafter_k: int):
+        _t0 = time.perf_counter()
+        """실제 블록 디퓨전 드래프터(DFlash2)의 깊이별 logits 로 트리를 만든다.
+
+        logits: [batch * drafter_k, vocab], 요청 우선(요청당 k행 연속).
+        DFlash 는 한 번의 forward 로 k개 위치 분포를 전부 내놓으므로,
+        DDTree 가 필요한 [depth, vocab] 행렬이 그대로 나온다 (논문 §3).
+
+        🔴 반환은 [num_reqs, budget] **GPU 텐서** 다 — 리스트가 아니다.
+           ngram 경로(_prepare_input_ids 의 동기 스케줄링)는 list[list[int]] 을
+           받지만, DFlash 경로는 비동기 스케줄링이라 드래프트를 GPU 텐서로
+           유지한다 (gpu_model_runner.py:1979 의 isinstance 단언,
+           :1989 의 flatten() 인덱싱, :5055 의 shape[1]).
+
+        🔴 요청마다 topk 결과를 CPU 로 내리므로 배치가 크면 동기화 비용이 크다.
+           성능 측정(M5) 전에 배치 topk + 단일 D2H 로 바꿔야 한다.
+        """
+        vocab = logits.shape[-1]
+        lg = logits.view(-1, drafter_k, vocab)
+        n = len(req_ids)
+        out = np.zeros((n, self.budget), dtype=np.int64)
+        for i, req_id in enumerate(req_ids):
+            if i >= lg.shape[0]:
+                self.pending.pop(req_id, None)
+                continue
+            _lg = lg[i][: self.depth_cap]
+            tree = build_tree_from_logits(
+                _lg, self.budget, topk_cap=self.topk_cap
+            )
+            if tree.num_nodes - 1 != self.budget:
+                # 이 스텝의 드래프트 폭과 트리 크기가 어긋나면 GDN 계층이 트리
+                # 정보를 못 받고 8토큰 상한이 있는 원본 커널로 떨어져 죽는다.
+                # 요청이 여럿이고 크기가 다를 때만 발생한다 (단일 요청이면 width
+                # 가 곧 그 트리의 크기다).
+                self.pending.pop(req_id, None)
+                continue
+            self.pending[req_id] = tree
+            out[i] = tree.token_ids
+        _r = torch.from_numpy(out).to(self.device)
+        self.t["propose"] += time.perf_counter() - _t0
+        return _r
 
     def _ngram_distributions(self, seq: np.ndarray):
         """마지막 n-gram 이 과거에 나온 모든 위치를 찾아, 깊이별 후속 토큰 분포를 만든다.
@@ -217,7 +260,7 @@ class DDTreeRuntime:
         #    폭만으로는 구분할 수 없다. 그러면 드래프터가 트리 마스크를 가져가고
         #    타깃이 causal 을 받아, 타깃에서 형제 노드가 서로를 보게 된다.
         #    (실측 2026-08-27: 예산 7 + 분기 → 출력 깨짐, 사슬은 무해해서 안 드러남)
-        if not self.step or self.no_mask:
+        if not self.step or self.no_mask or self.in_drafter:
             return None
         _t0 = time.perf_counter()
         qs = qo_indptr_cpu.tolist()
