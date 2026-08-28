@@ -66,7 +66,8 @@ class DDTreeRuntime:
                       "gdn_calls": 0, "gdn_tree": 0, "gdn_no_step": 0,
                       "gdn_nreq_mismatch": 0, "gdn_T_mismatch": 0,
                       "gdn_par_none": 0, "gdn_last": None,
-                      "gdn_cmp": None, "kv_groups": 0, "kv_rows": 0}
+                      "gdn_cmp": None, "kv_groups": 0, "kv_rows": 0,
+                      "tree_underfilled": 0, "compact_unsafe": 0}
         # 구간별 누적 시간(초) — 병목을 숫자로 본다
         self.t = {"propose": 0.0, "mask": 0.0, "accept": 0.0,
                   "kv_compact": 0.0, "gdn_compact": 0.0, "rope": 0.0}
@@ -129,6 +130,7 @@ class DDTreeRuntime:
                 # 정보를 못 받고 8토큰 상한이 있는 원본 커널로 떨어져 죽는다.
                 # 요청이 여럿이고 크기가 다를 때만 발생한다 (단일 요청이면 width
                 # 가 곧 그 트리의 크기다).
+                self.stats["tree_underfilled"] += 1
                 self.pending.pop(req_id, None)
                 continue
             self.pending[req_id] = tree
@@ -473,6 +475,8 @@ class DDTreeRuntime:
             #    경계를 넘으면 다음 블록 id 가 더 작을 수 있어(블록은 free pool 에서 나온다)
             #    전제가 깨지고, 나중 쓰기가 앞선 읽기의 원본을 덮는다.
             _viol = int((_dst > _src).sum().item())
+            if _viol:
+                self.stats["compact_unsafe"] += _viol
             if _viol or self.compact_impl == "torch":
                 # gather 후 scatter — 순서 전제가 없다
                 compact_mod.compact_kv_torch(

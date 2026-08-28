@@ -106,17 +106,62 @@ def build_tree(
 
 
 def build_tree_from_logits(draft_logits: torch.Tensor, budget: int,
-                          topk_cap: int = 1 << 30) -> Tree:
+                          topk_cap: int = 1 << 30,
+                          pad_to_budget: bool = True) -> Tree:
     """드래프터 logits [depth_limit, vocab] → Tree. topk/정규화는 GPU 에서.
 
     topk_cap=1 이면 분기가 없는 순수 사슬이 된다 (이분법용)."""
-    topk = max(1, min(budget, draft_logits.shape[-1], topk_cap))
+    vocab = draft_logits.shape[-1]
+    topk = max(1, min(budget, vocab, topk_cap))
+    # 패딩용 여분 후보까지 한 번에 뽑는다 (topk_cap=1 이면 topk 가 1 이라 모자람)
+    k_all = min(vocab, max(topk, budget + 1))
     logits = draft_logits.float()
-    top_logits, top_ids = torch.topk(logits, k=topk, dim=-1)
+    top_logits, top_ids = torch.topk(logits, k=k_all, dim=-1)
     log_z = torch.logsumexp(logits, dim=-1, keepdim=True)
     lp = (top_logits - log_z).to(device="cpu", dtype=torch.float32).numpy()
     ids = top_ids.to(device="cpu", dtype=torch.long).numpy()
-    return build_tree(lp, ids, budget)
+    tree = build_tree(lp[:, :topk], ids[:, :topk], budget)
+    if pad_to_budget:
+        pad_tree_to_budget(tree, ids[0], budget)
+    return tree
+
+
+def pad_tree_to_budget(tree: Tree, depth0_ids: np.ndarray, budget: int) -> Tree:
+    """루트 자식으로 무해한 노드를 붙여 노드 수를 예산에 맞춘다 (제자리 수정).
+
+    드래프터의 horizon 이 예산보다 짧으면 (예: topk_cap=1 인 순수 사슬은
+    깊이당 한 노드뿐이라 최대 horizon 개) 트리가 예산을 못 채운다. 그러면
+    vLLM 이 잡아둔 드래프트 슬롯 수와 어긋나고, GDN 계층이 트리 정보를 못 받아
+    8토큰 상한이 있는 원본 커널로 떨어져 죽는다 (state_indices [N,S] S<=8).
+
+    붙이는 노드는 깊이 0 분포의 아직 안 쓴 상위 토큰이다. 타깃이 그 토큰을
+    뽑으면 그대로 수용되고 — 그게 곧 greedy 정답이므로 무손실이다 — 아니면
+    버려진다. child_maps 가 토큰을 키로 쓰므로 중복 토큰은 절대 넣지 않는다.
+    """
+    need = budget - (tree.num_nodes - 1)
+    if need <= 0:
+        return tree
+    root_children = tree.child_maps[0]
+    extra_tokens, extra_depths = [], []
+    for tok in depth0_ids.tolist():
+        if len(extra_tokens) >= need:
+            break
+        if tok in root_children:
+            continue
+        root_children[tok] = tree.num_nodes + len(extra_tokens)  # 루트 포함 인덱스
+        extra_tokens.append(tok)
+        extra_depths.append(1)
+    if not extra_tokens:
+        return tree
+    tree.token_ids = np.concatenate(
+        [tree.token_ids, np.asarray(extra_tokens, dtype=tree.token_ids.dtype)])
+    tree.depths = np.concatenate(
+        [tree.depths, np.asarray(extra_depths, dtype=tree.depths.dtype)])
+    tree.parents.extend([0] * len(extra_tokens))
+    tree.child_maps.extend({} for _ in extra_tokens)
+    tree.num_nodes += len(extra_tokens)
+    tree._vis = None                                   # 캐시 무효화
+    return tree
 
 
 def flat_tree_mask(
