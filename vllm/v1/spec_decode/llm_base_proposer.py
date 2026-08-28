@@ -254,6 +254,7 @@ class SpecDecodeBaseProposer:
             and self.speculative_config.draft_sample_method == "probabilistic"
         )
         self._last_draft_probs: torch.Tensor | None = None
+        self._last_draft_logits: torch.Tensor | None = None   # DDTree 용
 
         self._slot_mapping_buffer = torch.zeros(
             self.max_positions, dtype=torch.int64, device=device
@@ -443,7 +444,12 @@ class SpecDecodeBaseProposer:
             logits = self.vocab_mapping.constrain_draft_logits(logits)
             draft_token_ids = logits.argmax(dim=-1)
             return self.vocab_mapping.map_draft_to_target_ids(draft_token_ids)
-        return self.model.compute_logits(hidden_states).argmax(dim=-1)
+        logits = self.model.compute_logits(hidden_states)
+        # 🔴 DDTree: T=0(all_greedy) 에서는 _last_draft_probs 가 채워지지 않는다
+        #    (_enable_probabilistic_draft_probs 가 꺼짐). 트리를 만들려면 깊이별
+        #    분포가 필요하므로 logits 를 남긴다. [batch * k, vocab], 요청 우선 순서.
+        self._last_draft_logits = logits
+        return logits.argmax(dim=-1)
 
     def _sample_from_logits(
         self,
@@ -507,6 +513,11 @@ class SpecDecodeBaseProposer:
     def take_last_draft_probs(self) -> torch.Tensor | None:
         return self._last_draft_probs
 
+    def take_last_draft_logits(self) -> torch.Tensor | None:
+        """DDTree 용 — 마지막 드래프터 forward 의 깊이별 logits.
+        [batch * drafter_k, vocab], 요청 우선(요청당 k행 연속)."""
+        return self._last_draft_logits
+
     def propose(
         self,
         num_speculative_tokens,
@@ -529,6 +540,7 @@ class SpecDecodeBaseProposer:
     ) -> torch.Tensor:
         self.num_speculative_tokens = num_speculative_tokens
         self._last_draft_probs = None
+        self._last_draft_logits = None   # DDTree
         batch_size = common_attn_metadata.batch_size()
 
         if self.method in ("eagle3", "dflash"):
@@ -628,11 +640,17 @@ class SpecDecodeBaseProposer:
             draft_token_ids, draft_probs = self._sample_draft_tokens(
                 sample_hidden_states, sampling_metadata
             )
+            # 🔴 DDTree: 병렬 드래프팅(DFlash)에서는 드래프터가 실제로 내놓는
+            #    위치 수가 num_speculative_tokens 와 다를 수 있다.
+            #    num_speculative_tokens 는 'vLLM 이 스케줄하는 드래프트 수'
+            #    (= DDTree 의 트리 예산) 이고, drafter_k 는 '드래프터의 지평'
+            #    (= 체크포인트 block_size - 1) 이다. 정형은 후자로 해야 한다.
+            _k = getattr(self, "drafter_k", self.num_speculative_tokens)
             if draft_probs is not None:
                 self._last_draft_probs = draft_probs.view(
-                    -1, self.num_speculative_tokens, draft_probs.shape[-1]
+                    -1, _k, draft_probs.shape[-1]
                 ).contiguous()
-            return draft_token_ids.view(-1, self.num_speculative_tokens)
+            return draft_token_ids.view(-1, _k)
 
         if self.uses_mrope:
             positions = self.mrope_positions[:, token_indices_to_sample]

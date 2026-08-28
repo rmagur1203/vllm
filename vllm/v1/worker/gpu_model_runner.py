@@ -5435,6 +5435,17 @@ class GPUModelRunner(
                     self._draft_probs = draft_probs
                     self._draft_prob_req_ids = self.input_batch.req_ids.copy()
 
+        # 🔴 DDTree: 드래프터가 돈 뒤 '깊이별 logits' 로 트리를 만든다.
+        #    드래프터가 돌려준 평면 체인 드래프트는 버린다 — 우리는 같은 분포
+        #    위에 가지를 친 트리를 대신 스케줄한다.
+        if self.ddtree is not None and not self.ddtree.use_ngram_drafter:
+            _take = getattr(self.drafter, "take_last_draft_logits", None)
+            _lg = _take() if _take is not None else None
+            if _lg is not None:
+                return self.ddtree.propose_from_drafter_logits(
+                    self.input_batch.req_ids, _lg, self.drafter.drafter_k
+                )
+
         return draft_token_ids
 
     def update_config(self, overrides: dict[str, Any]) -> None:

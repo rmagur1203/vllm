@@ -128,7 +128,21 @@ class DFlash2Qwen3DecoderLayer(DFlashQwen3DecoderLayer):
             taps=int(draft_config["conv_kernel_size"]),
             group_size=int(draft_config["conv_group_size"]),
             # Query tokens per request: the bonus token plus the mask tokens.
-            block_size=1 + speculative_config.num_speculative_tokens,
+            #
+            # 🔴 DDTree: 학습된 block_size 를 우선한다.
+            #    원본은 1 + num_speculative_tokens 였는데, 그러면 '드래프터의 지평'과
+            #    'vLLM 이 스케줄하는 드래프트 개수'가 한 값에 묶인다.
+            #    DFlash2 체크포인트는 block_size=8 로 학습됐으므로 그 결합 하에서는
+            #    num_speculative_tokens 가 7 이어야 하고, 곧 트리 예산도 7 로 묶인다
+            #    (논문은 16~1024 를 쓴다).
+            #    vLLM 은 DFlash 에 대해 이 불일치를 검사하지 않는다 —
+            #    speculative.py:174 의 block_size 검사는 DSpark 전용이다.
+            #    따라서 결합 상태에서 예산을 키우면 크래시 없이 conv 만 조용히
+            #    어긋난 폭으로 동작한다.
+            block_size=int(
+                (config.dflash_config or {}).get("block_size")
+                or (1 + speculative_config.num_speculative_tokens)
+            ),
             params_dtype=vllm_config.model_config.dtype,
         )
         self.attention_conv = DFlashGroupedConv(

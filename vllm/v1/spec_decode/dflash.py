@@ -36,8 +36,18 @@ class DFlashProposer(SpecDecodeBaseProposer):
             runner=runner,
         )
 
+        # 🔴 DDTree: 드래프터의 지평(drafter_k)을 스케줄되는 드래프트 개수와 분리한다.
+        #    num_speculative_tokens 는 vLLM 이 요청당 스케줄하는 드래프트 토큰 수
+        #    (= DDTree 의 트리 예산) 이고, drafter_k 는 블록 디퓨전 드래프터가
+        #    한 번에 내놓는 위치 수 (= 체크포인트의 block_size - 1) 다.
+        #    평면 DFlash 에서는 둘이 같지만 트리에서는 예산 >> 지평 이다.
+        self.drafter_k = int(
+            (self.dflash_config or {}).get("block_size")
+            or (1 + self.num_speculative_tokens)
+        ) - 1
+
         # Only next_token_ids and mask tokens are query tokens, all other context is K/V
-        self.max_query_tokens = self.max_batch_size * (1 + self.num_speculative_tokens)
+        self.max_query_tokens = self.max_batch_size * (1 + self.drafter_k)
         self.max_padded_query_tokens = max(
             self.max_query_tokens,
             vllm_config.compilation_config.max_cudagraph_capture_size or 0,
@@ -131,7 +141,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
         # Q from query embeddings (bonus + mask tokens).
         batch_size = cad.batch_size()
         num_context = target_token_ids.shape[0]
-        num_query_per_req = 1 + self.num_speculative_tokens
+        num_query_per_req = 1 + self.drafter_k
         num_query_total = batch_size * num_query_per_req
 
         # Store for build_model_inputs_first_pass to use
@@ -142,7 +152,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
         self._dflash_hidden_states = target_hidden_states
 
         token_indices_to_sample = torch.empty(
-            batch_size * self.num_speculative_tokens,
+            batch_size * self.drafter_k,
             dtype=torch.int32,
             device=self.device,
         )
@@ -179,7 +189,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
             parallel_drafting_token_id=self.parallel_drafting_token_id,
             block_size=self.block_size,
             num_query_per_req=num_query_per_req,
-            num_speculative_tokens=self.num_speculative_tokens,
+            num_speculative_tokens=self.drafter_k,
             total_input_tokens=num_context,
             BLOCK_SIZE=BLOCK_SIZE,
             HAS_NUM_REJECTED=has_num_rejected,
