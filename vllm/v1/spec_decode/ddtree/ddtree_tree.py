@@ -48,6 +48,7 @@ def build_tree(
     top_log_probs: np.ndarray,   # [depth_limit, topk] 내림차순
     top_token_ids: np.ndarray,   # [depth_limit, topk]
     budget: int,
+    spine: bool = False,
 ) -> Tree:
     """best-first 힙으로 노드 예산만큼 트리를 넓힌다.
 
@@ -56,6 +57,12 @@ def build_tree(
       - 자식(깊이+1, rank 0)
     을 밀어 넣어, '타깃과 일치할 확률이 높은 순서'로 예산을 배분한다.
 
+    spine=True 는 참조 구현에서 벗어난다. 누적 log-prob 은 깊이가 늘 때마다 단조
+    감소하므로 best-first 는 **구조적으로 폭을 깊이보다 선호**한다. 그런데 실측에서
+    수용 길이는 양극단이었다 — 즉시 실패하거나 지평 전체를 받아낸다 — 그리고 수용
+    토큰의 80%가 길이 5 이상, 52%가 길이 8 이상에서 나왔다 (2026-08-28, 4B bf16).
+    깊이를 못 내면 값어치의 대부분을 잘라먹는다. 그래서 지평까지 사슬(척추)을 먼저
+    확보하고, 남는 예산만 best-first 로 분기에 쓴다.
     """
     depth_limit, topk = top_log_probs.shape
     if budget <= 0 or depth_limit == 0:
@@ -71,8 +78,29 @@ def build_tree(
     child_maps: list[dict[int, int]] = [dict()]
     n = 0
 
-    first = float(top_log_probs[0, 0])
-    heap.append((-first, (0,), 0, 1, 0, first))
+    if spine:
+        # 척추: 깊이마다 rank 0 을 골라 지평까지 사슬을 먼저 깐다.
+        # 각 척추 노드의 형제(rank 1)를 힙에 심어, 남은 예산이 그 위에서 분기하게 한다.
+        parent_index, logw = 0, 0.0
+        for d in range(1, min(depth_limit, budget) + 1):
+            lp = float(top_log_probs[d - 1, 0])
+            logw += lp
+            token_id = int(top_token_ids[d - 1, 0])
+            cur = n + 1
+            node_token_ids[n] = token_id
+            node_depths[n] = d
+            parents[cur] = parent_index
+            child_maps.append(dict())
+            child_maps[parent_index][token_id] = cur
+            n += 1
+            if topk > 1:
+                w = logw - lp + float(top_log_probs[d - 1, 1])
+                heapq.heappush(
+                    heap, (-w, (0,) * (d - 1) + (1,), parent_index, d, 1, w))
+            parent_index = cur
+    else:
+        first = float(top_log_probs[0, 0])
+        heap.append((-first, (0,), 0, 1, 0, first))
 
     while heap and n < budget:
         _, ranks, parent_index, depth, rank, logw = heapq.heappop(heap)
@@ -107,7 +135,11 @@ def build_tree(
 
 def build_tree_from_logits(draft_logits: torch.Tensor, budget: int,
                           topk_cap: int = 1 << 30,
-                          pad_to_budget: bool = True) -> Tree:
+                          pad_to_budget: bool = True,
+                          spine: bool = False,
+                          depth_bonus: float = 0.0,
+                          dynamic_tau: float | None = None,
+                          allow_short: bool = False) -> Tree:
     """드래프터 logits [depth_limit, vocab] → Tree. topk/정규화는 GPU 에서.
 
     topk_cap=1 이면 분기가 없는 순수 사슬이 된다 (이분법용)."""
@@ -120,7 +152,43 @@ def build_tree_from_logits(draft_logits: torch.Tensor, budget: int,
     log_z = torch.logsumexp(logits, dim=-1, keepdim=True)
     lp = (top_logits - log_z).to(device="cpu", dtype=torch.float32).numpy()
     ids = top_ids.to(device="cpu", dtype=torch.long).numpy()
-    tree = build_tree(lp[:, :topk], ids[:, :topk], budget)
+    return shape_and_build(lp, ids, budget, topk=topk, spine=spine,
+                           depth_bonus=depth_bonus, dynamic_tau=dynamic_tau,
+                           allow_short=allow_short, pad_to_budget=pad_to_budget)
+
+
+def shape_and_build(lp: np.ndarray, ids: np.ndarray, budget: int, *,
+                    topk: int, spine: bool = False, depth_bonus: float = 0.0,
+                    dynamic_tau: float | None = None, allow_short: bool = False,
+                    pad_to_budget: bool = True) -> Tree:
+    """모양 결정 + 트리 생성. DFlash 경로와 ngram 경로가 함께 쓴다.
+
+    🔴 예전에는 이 로직이 build_tree_from_logits 안에만 있어서 ngram 경로
+       (runtime.propose)가 build_tree 를 직접 불렀고, spine/depth_bonus/
+       dynamic_tau 손잡이가 **전부 무시됐다**. 순수 어텐션 실험에서 동적 선택과
+       진짜 사슬이 아무 효과가 없던 원인이다 (2026-08-28).
+    """
+    topk = max(1, min(topk, lp.shape[1]))
+    if dynamic_tau is not None:
+        # 동적 모양 선택. 예산(=검증 forward 토큰 수)은 엔진 초기화 때 고정이라
+        # 스텝마다 못 바꾼다. 그러나 같은 예산 안에서 모양은 바꿀 수 있다.
+        # 판단 근거는 드래프터가 말하는 기대 사슬 길이 E = Σ_d ∏_{i<=d} p_i 다.
+        # 실측(t21_calib)에서 E 는 실제 수용을 ~2배 과소평가하지만 스텝 간
+        # **상대 비교**에는 쓸 수 있다 (피어슨 상관 0.748).
+        e_chain = float(np.cumprod(np.exp(lp[:, 0])).sum())
+        spine = e_chain >= dynamic_tau
+        if spine and allow_short:
+            # 진짜 사슬: 예산 전부를 깊이에 쏟고, 후보가 모자라면 짧은 드래프트를
+            # 낸다. vLLM 은 스텝마다 폭을 다시 읽는다(prev_num_spec_tokens).
+            topk = 1
+            pad_to_budget = False
+
+    if depth_bonus:
+        # 🔴 log-prob 에 상수를 '곱하면' 무연산이다 — 단조 변환이라 heap 순서가
+        #    그대로다. 깊이 d 노드가 얕은 형제 대비 depth_bonus*(d-1) 이득을
+        #    보려면 '더해야' 한다. 같은 깊이 형제끼리는 상수가 상쇄된다.
+        lp = lp + depth_bonus
+    tree = build_tree(lp[:, :topk], ids[:, :topk], budget, spine=spine)
     if pad_to_budget:
         pad_tree_to_budget(tree, ids[0], budget)
     return tree
