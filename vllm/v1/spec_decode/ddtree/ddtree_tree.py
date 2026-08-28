@@ -27,6 +27,10 @@ class Tree:
     num_nodes: int                 # 루트 포함
 
     _vis: np.ndarray | None = field(default=None, repr=False)
+    # 깊이별 상위 2개 log-prob — 드래프터 확률의 보정 상태를 사후 분석하려고 남긴다
+    lp_top: list | None = field(default=None, repr=False)
+    dyn_mode: str | None = field(default=None, repr=False)   # 동적 모양 선택 결과
+    e_chain: float | None = field(default=None, repr=False)  # 기대 사슬 길이
 
     @property
     def visibility(self) -> np.ndarray:
@@ -169,6 +173,8 @@ def shape_and_build(lp: np.ndarray, ids: np.ndarray, budget: int, *,
        진짜 사슬이 아무 효과가 없던 원인이다 (2026-08-28).
     """
     topk = max(1, min(topk, lp.shape[1]))
+    _mode = None
+    e_chain = None
     if dynamic_tau is not None:
         # 동적 모양 선택. 예산(=검증 forward 토큰 수)은 엔진 초기화 때 고정이라
         # 스텝마다 못 바꾼다. 그러나 같은 예산 안에서 모양은 바꿀 수 있다.
@@ -182,6 +188,7 @@ def shape_and_build(lp: np.ndarray, ids: np.ndarray, budget: int, *,
             # 낸다. vLLM 은 스텝마다 폭을 다시 읽는다(prev_num_spec_tokens).
             topk = 1
             pad_to_budget = False
+        _mode = "chain" if spine else "tree"
 
     if depth_bonus:
         # 🔴 log-prob 에 상수를 '곱하면' 무연산이다 — 단조 변환이라 heap 순서가
@@ -189,6 +196,9 @@ def shape_and_build(lp: np.ndarray, ids: np.ndarray, budget: int, *,
         #    보려면 '더해야' 한다. 같은 깊이 형제끼리는 상수가 상쇄된다.
         lp = lp + depth_bonus
     tree = build_tree(lp[:, :topk], ids[:, :topk], budget, spine=spine)
+    tree.lp_top = (lp[:, : min(2, lp.shape[1])] - depth_bonus).tolist()
+    tree.dyn_mode = _mode
+    tree.e_chain = e_chain
     if pad_to_budget:
         pad_tree_to_budget(tree, ids[0], budget)
     return tree

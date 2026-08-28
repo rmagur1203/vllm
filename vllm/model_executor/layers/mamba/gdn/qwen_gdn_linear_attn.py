@@ -1766,6 +1766,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 state_indices[:num_requests].tolist(),
                 conv_weights.shape[-1], _info["keys"],
             )
+        # --- DDTree 진단: conv 상태를 스텝 경계로 덤프한다 (VLLM_DDTREE_CONVDUMP=N) ---
+        #     합성 호출이 아니라 프로덕션 인자 그대로 잡아야 인계 검증이 성립한다.
+        _cd = _ddtree_conv_dump_begin(
+            self, conv_state, mixed_qkv[:num_actual_tokens], state_indices,
+            num_accepted_tokens, num_requests,
+            None if _info is None else _info["tree_cols"])
         mixed_qkv = causal_conv1d_update(
             mixed_qkv[:num_actual_tokens],
             conv_state,
@@ -1779,6 +1785,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             max_query_len=state_indices.size(1),
             validate_data=False,
         )
+        _ddtree_conv_dump_end(_cd, conv_state)
         self._forward_core_decode_spec_post_conv_fused_norm(
             mixed_qkv=mixed_qkv,
             b=b[:num_actual_tokens],
@@ -1816,6 +1823,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
             _ext = get_ext()
             if _ext is not None:
+                import os as _os
+                _chk = _os.environ.get("VLLM_DDTREE_GDN_CHECK") in ("1", "2")
+                if _chk:
+                    # 🔴 상태 캐시 전체는 GB 단위다 — 이번 스텝이 건드리는 슬롯만 복제한다
+                    _slots = state_indices[:num_requests].reshape(-1).unique()
+                    _snap = self.kv_cache[1][_slots].clone()
                 _ext.gdn_decode_tree_mtp(
                     mixed_qkv, a, b, self.A_log, self.dt_bias,
                     state_indices[:num_requests].contiguous(),
@@ -1826,6 +1839,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     core_attn_out, self.head_k_dim**-0.5,
                     self.layer_norm_epsilon,
                 )
+                if _chk:
+                    _ddtree_gdn_crosscheck(
+                        self, _slots, _snap, mixed_qkv, a, b, state_indices,
+                        cu_seqlens, num_accepted_tokens, _info, num_requests,
+                        core_attn_out, output_gate)
                 return
 
         ops.fused_gdn_decode_post_conv_mtp(
@@ -2142,3 +2160,151 @@ def fused_gdn_gating(
         num_warps=1,
     )
     return g, beta_output
+
+
+# ---------------------------------------------------------------------------
+# DDTree 진단: 같은 입력에 CUDA 트리 커널과 Triton 참조를 모두 돌려 SSM 상태를 비교한다.
+# VLLM_DDTREE_GDN_CHECK=1 일 때만 동작한다. 상태 캐시는 GB 단위라 전체를 복제하면
+# OOM 이 나므로, 이번 스텝이 건드리는 슬롯만 스냅샷한다.
+# ---------------------------------------------------------------------------
+_DDTREE_CHECK_STATE = {"calls": 0, "bad": 0, "dumped": False}
+
+
+def _ddtree_gdn_crosscheck(layer, slots, snap, mixed_qkv, a, b, state_indices,
+                           cu_seqlens, num_accepted_tokens, info, num_requests,
+                           core_attn_out, output_gate):
+    import os
+    import torch
+    from vllm.third_party.flash_linear_attention.ops.fused_sigmoid_gating import (
+        fused_sigmoid_gating_delta_rule_update,
+    )
+    d = _DDTREE_CHECK_STATE
+    d["calls"] += 1
+    st_cuda = layer.kv_cache[1][slots].clone()
+    out_cuda = core_attn_out.clone()
+    layer.kv_cache[1][slots] = snap              # Triton 을 같은 초기상태에서 출발시킨다
+    q, k, v = layer.rearrange_mixed_qkv(mixed_qkv)
+    out_tri_raw, _ = fused_sigmoid_gating_delta_rule_update(
+        A_log=layer.A_log, a=a, b=b, dt_bias=layer.dt_bias, q=q, k=k, v=v,
+        initial_state=layer.kv_cache[1], inplace_final_state=True,
+        cu_seqlens=cu_seqlens[: num_requests + 1],
+        ssm_state_indices=state_indices,
+        num_accepted_tokens=num_accepted_tokens,
+        tree_parent_indices=info["parents"],
+        use_qk_l2norm_in_kernel=True,
+    )
+    st_tri = layer.kv_cache[1][slots].clone()
+    # CUDA 커널은 게이팅+RMSNorm 을 내부에서 한다 — Triton 쪽에도 같은 후처리를 건다
+    # Triton 쪽은 앞에 배치 축이 붙어 나올 수 있다 — CUDA 출력 모양으로 맞춘다
+    out_tri_raw = out_tri_raw.reshape(out_cuda.shape).contiguous()
+    out_tri = torch.empty_like(out_cuda)
+    try:
+        layer._rms_norm_gated_cuda(out_tri_raw, output_gate, out_tri)
+    except Exception as e:                                   # 진단이 본 실행을 죽이지 않게
+        if not d.get("normwarn"):
+            d["normwarn"] = True
+            print(f"[DDTREE-GDN 교차검증] 정규화 건너뜀: {type(e).__name__} {e} "
+                  f"out={tuple(out_cuda.shape)} gate={tuple(output_gate.shape)}", flush=True)
+        out_tri = out_tri_raw
+
+    def _rel(x, y):
+        den = max(1e-6, y.float().abs().max().item())
+        return (x.float() - y.float()).abs().max().item() / den
+
+    # 🔴 깊은 트리 스텝을 골라 덤프한다. fp64 검증을 얕은 스텝에만 하면
+    #    "커널 정상" 이 깊이 8 에서도 성립한다는 보장이 없다.
+    _want = int(os.environ.get("VLLM_DDTREE_DUMP_DEPTH", "0"))
+    if _want and not d.get("dumped_deep"):
+        _p = info["parents"][0].tolist()
+        _dep = [0] * len(_p)
+        for _i in range(1, len(_p)):
+            _dep[_i] = _dep[_p[_i]] + 1 if _p[_i] >= 0 else 0
+        if max(_dep) >= _want:
+            d["dumped_deep"] = True
+            print(f"[DDTREE-GDN] 깊이 {max(_dep)} 스텝 덤프 (호출#{d['calls']})", flush=True)
+            torch.save({"mixed_qkv": mixed_qkv.cpu(), "a": a.cpu(), "b": b.cpu(),
+                        "state_indices": state_indices.cpu(), "cu_seqlens": cu_seqlens.cpu(),
+                        "num_accepted": num_accepted_tokens.cpu(),
+                        "parents": info["parents"].cpu(), "slots": slots.cpu(),
+                        "snap": snap.cpu(), "output_gate": output_gate.cpu(),
+                        "A_log": layer.A_log.cpu(), "dt_bias": layer.dt_bias.cpu(),
+                        "norm_weight": layer.norm.weight.cpu(),
+                        "num_requests": num_requests, "max_depth": max(_dep)},
+                       os.environ.get("VLLM_DDTREE_DEEPDUMP", "/work/gdn_deep.pt"))
+    r_st, r_out = _rel(st_cuda, st_tri), _rel(out_cuda, out_tri)
+    d["max_state"] = max(d.get("max_state", 0.0), r_st)
+    d["max_out"] = max(d.get("max_out", 0.0), r_out)
+    if d["calls"] % 400 == 0:
+        print(f"[DDTREE-GDN 교차검증] {d['calls']}회  누적 최대 상대오차 "
+              f"상태 {d['max_state']:.5f} / 출력 {d['max_out']:.5f}", flush=True)
+    dif, ref = max(r_st, r_out), 1.0
+    if dif > 1e-3:
+        d["bad"] += 1
+        if not d["dumped"]:
+            d["dumped"] = True
+            print(f"[DDTREE-GDN 불일치] 호출#{d['calls']} 상대오차 상태 {r_st:.5f} "
+                  f"출력 {r_out:.5f} T={mixed_qkv.shape[0]//max(1,num_requests)} "
+                  f"accepted={num_accepted_tokens[:num_requests].tolist()} "
+                  f"부모={info['parents'][:num_requests].tolist()}", flush=True)
+            torch.save({"mixed_qkv": mixed_qkv.cpu(), "a": a.cpu(), "b": b.cpu(),
+                        "state_indices": state_indices.cpu(),
+                        "cu_seqlens": cu_seqlens.cpu(),
+                        "num_accepted": num_accepted_tokens.cpu(),
+                        "parents": info["parents"].cpu(),
+                        "slots": slots.cpu(), "snap": snap.cpu(),
+                        "output_gate": output_gate.cpu(),
+                        "A_log": layer.A_log.cpu(), "dt_bias": layer.dt_bias.cpu(),
+                        "norm_weight": layer.norm.weight.cpu(),
+                        "num_requests": num_requests},
+                       os.environ.get("VLLM_DDTREE_DUMP", "/work/gdn_mismatch.pt"))
+    # VLLM_DDTREE_GDN_CHECK=2 : 실행을 Triton 결과로 이어간다 (A/B 확정용).
+    # 출력만 바꿔치기해서 무손실이 회복되면 0.2% 출력 차이가 원인이고,
+    # 그대로 깨지면 교차검증이 '비교하지 않는' 지점(융합 경로 conv 등)이 원인이다.
+    if os.environ.get("VLLM_DDTREE_GDN_CHECK") == "2":
+        core_attn_out.copy_(out_tri)
+        return                                    # 상태도 Triton 것을 남긴다
+    layer.kv_cache[1][slots] = st_cuda           # 실행은 CUDA 결과로 계속한다
+
+
+# ---------------------------------------------------------------------------
+# DDTree 진단: conv 상태 스텝 경계 덤프
+#   스텝 N 의 conv 호출 전/후 블록과, 스텝 N+1 의 호출 전 블록(= 압축 반영 후)을
+#   모은다. 이걸로 "압축이 남긴 상태" 와 "다음 스텝이 실제로 읽는 열" 을 대조한다.
+# ---------------------------------------------------------------------------
+_CONV_DUMP = {"want": 0, "layer": None, "recs": [], "path": None}
+
+
+def _ddtree_conv_dump_begin(layer, conv_state, x, state_indices,
+                            num_accepted_tokens, num_requests, tree_cols):
+    import os
+    d = _CONV_DUMP
+    if not d["want"]:
+        d["want"] = int(os.environ.get("VLLM_DDTREE_CONVDUMP", "0") or 0)
+        d["path"] = os.environ.get("VLLM_DDTREE_CONVDUMP_FILE", "/work/conv_steps.pt")
+        if not d["want"]:
+            d["want"] = -1
+    if d["want"] < 0 or len(d["recs"]) >= d["want"]:
+        return None
+    if d["layer"] is None:
+        d["layer"] = id(layer)          # 첫 GDN 계층만 추적한다 (용량)
+    if id(layer) != d["layer"]:
+        return None
+    slot = int(state_indices[0, 0])
+    return {"before": conv_state[slot].detach().clone().cpu(),
+            "x": x.detach().clone().cpu(),
+            "slot": slot,
+            "state_indices": state_indices[:num_requests].detach().cpu(),
+            "num_accepted": num_accepted_tokens[:num_requests].detach().cpu(),
+            "tree_cols": None if tree_cols is None else tree_cols.detach().cpu()}
+
+
+def _ddtree_conv_dump_end(rec, conv_state):
+    import torch
+    d = _CONV_DUMP
+    if rec is None:
+        return
+    rec["after"] = conv_state[rec["slot"]].detach().clone().cpu()
+    d["recs"].append(rec)
+    if len(d["recs"]) >= d["want"]:
+        torch.save(d["recs"], d["path"])
+        print(f"[DDTREE-CONV] {len(d['recs'])} 스텝 덤프 → {d['path']}", flush=True)

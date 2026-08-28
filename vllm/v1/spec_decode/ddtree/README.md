@@ -55,8 +55,10 @@ DDTree (Diffusion Draft Tree, arXiv:2604.12989) 를 vLLM 에 구현한 것.
 
 1. **정확성 기준을 모델 종류별로 나눠야 한다.** 아래 §정확성 기준 참조.
    커널 자체는 fp64 로 검증했고 결함이 없다 — 고칠 코드가 아니라 바꿀 기준이다.
-2. **모듈 배치와 import.** (아래 3번과 함께)
-3. **import 정리.** 새 모듈들이 서로를 평면 이름으로 import 한다
+2. **디버그 발판 제거.** `VLLM_DDTREE_GDN_CHECK`(CUDA vs Triton 상태 교차검증),
+   `VLLM_DDTREE_TRACE`, `lp_top`/`dyn_mode`/`e_chain` 필드, 각종 통계 히스토그램.
+   측정용이라 프로덕션 경로에 있으면 안 된다.
+3. **모듈 배치와 import.** 새 모듈들이 서로를 평면 이름으로 import 한다
    (`from ddtree_tree import ...`). 패키지 상대 import 로 바꿔야 한다.
    `gpu_model_runner` 패치와 `qwen_gdn_linear_attn` 패치가 `/work`, `/work/cuda`
    를 `sys.path` 에 넣는 부분도 제거 대상이다.
@@ -125,21 +127,10 @@ DDTree (Diffusion Draft Tree, arXiv:2604.12989) 를 vLLM 에 구현한 것.
   - 비트 일치가 꼭 필요하면 `VLLM_GDN_DECODE_KERNEL=triton` 으로 융합 CUDA 커널을
     끈다 (실측 무손실, 대신 느리다).
 
-### 이탈을 판정하는 법
+### 이탈을 판정하는 법 (`tests/ddtree/t19_tiegap.py`)
 
 base 의 위치별 top-1/top-2 로짓 격차를 재서 분류한다. 격차가 분포 하위 5% 미만이면
 수치적 동점이고, 중앙값 근처면 진짜 이탈이다.
 
 🔴 "출력이 자연스러우니 수치겠지" 도, "🔴 표시가 떴으니 버그" 도 근거가 안 된다.
    이 프로젝트에서 두 방향 모두로 오판한 적이 있다. 격차를 재기 전에는 판정하지 않는다.
-
-
-## 이 커밋 뒤에 오는 것 (업스트림 대상 아님)
-
-`ddtree-upstream` 태그까지가 업스트림 후보다. 그 뒤 두 커밋은 따로 다룬다.
-
-  - **트리 모양 정책** (척추 우선·깊이 보정·동적 선택). 전부 기본값 off. 실측에서
-    순이득이 없었다 — 기본 트리 4.20s vs 정책 적용 4.31~4.48s (순수 어텐션 기준).
-    기록과 재현을 위해 남긴다.
-  - **진단 계측** (`VLLM_DDTREE_GDN_CHECK`, `VLLM_DDTREE_TRACE`, 통계 히스토그램,
-    추적 스크립트). 측정용이라 프로덕션 경로에 있으면 안 된다.

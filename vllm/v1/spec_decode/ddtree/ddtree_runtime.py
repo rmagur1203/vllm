@@ -48,6 +48,9 @@ class DDTreeRuntime:
         # 확신 시 예산 전부를 깊이에 쏟는다. 트리가 예산보다 짧아질 수 있어
         # 스텝의 드래프트 폭이 줄어든다 — 요청이 하나일 때만 켠다(아래 참조).
         self.true_chain = _os.environ.get("VLLM_DDTREE_TRUECHAIN") == "1"
+        self.trace_n = int(_os.environ.get("VLLM_DDTREE_TRACE", "0"))
+        self.trace: list = []
+        self._emitted: dict = {}
         self.depth_cap = 1 << 30   # 드래프터 깊이를 잘라 얕은 트리만 만든다 — 디버깅용
         self.no_accept = False     # True 면 절대 수용 안 함 — 배선 격리용
         self.no_mask = False       # True 면 마스크 자체를 안 준다 — 이분법용
@@ -75,7 +78,11 @@ class DDTreeRuntime:
                       "gdn_nreq_mismatch": 0, "gdn_T_mismatch": 0,
                       "gdn_par_none": 0, "gdn_last": None,
                       "gdn_cmp": None, "kv_groups": 0, "kv_rows": 0,
-                      "tree_underfilled": 0, "compact_unsafe": 0}
+                      "tree_underfilled": 0, "compact_unsafe": 0,
+                      # 평균만 보면 꼬리가 안 보인다 — 분포를 직접 센다
+                      "acc_hist": [0] * 65, "depth_hist": [0] * 65,
+                      # 동적 선택이 옳았는지 — 모드별 수용/스텝수
+                      "dyn": {"chain": [0, 0], "tree": [0, 0]}}
         # 구간별 누적 시간(초) — 병목을 숫자로 본다
         self.t = {"propose": 0.0, "mask": 0.0, "accept": 0.0,
                   "kv_compact": 0.0, "gdn_compact": 0.0, "rope": 0.0}
@@ -165,6 +172,8 @@ class DDTreeRuntime:
                 self.pending.pop(req_id, None)
                 continue
             self.pending[req_id] = tree
+            self.stats["depth_hist"][
+                min(int(tree.depths.max()) if len(tree.depths) else 0, 64)] += 1
             out[i] = tree.token_ids
         _r = torch.from_numpy(out).to(self.device)
         self.t["propose"] += time.perf_counter() - _t0
@@ -428,8 +437,31 @@ class DDTreeRuntime:
                 paths[i] = acc
                 self.prev_paths[self.all_req_ids[i]] = acc
                 emitted = [sampled[a] for a in acc]
+                if len(self.trace) < self.trace_n:
+                    # 분기 노드의 문맥이 옳은지 사후 검증하기 위한 원자료.
+                    # 노드 i 의 sampled[i] 는 '조상 경로를 평범한 시퀀스로 이어붙여
+                    # 돌린 결과의 argmax' 와 같아야 한다 — 그게 트리 마스크/RoPE 의 정의다.
+                    _rid = self.all_req_ids[i]
+                    self.trace.append({
+                        "req": str(_rid),
+                        "emitted_before": self._emitted.get(_rid, 0),
+                        # 🔴 방출 카운터는 스펙이 안 붙은 스텝(ngram 일치 없음 등)을
+                        #    놓쳐 오프셋이 스텝마다 달라진다. 실제 접두사 길이를 직접
+                        #    기록해야 사후 검증에서 정렬을 추정하지 않아도 된다.
+                        "prefix_len": int(self.num_computed[i]) if self.num_computed is not None else -1,
+                        "tokens": [int(x) for x in tree.token_ids],
+                        "parents": [int(x) for x in tree.parents],
+                        "depths": [int(x) for x in tree.depths],
+                        "sampled": [int(x) for x in sampled],
+                        "accepted": [int(x) for x in acc],
+                        "lp_top": tree.lp_top,
+                    })
                 self.stats["accepted"] += len(acc) - 1
                 self.stats["nodes"] += tree.num_nodes - 1
+                self.stats["acc_hist"][min(len(acc) - 1, 64)] += 1
+                if tree.dyn_mode:
+                    _b = self.stats["dyn"][tree.dyn_mode]
+                    _b[0] += len(acc) - 1; _b[1] += 1
             elif cu_draft[i] > d_starts[i]:
                 # 트리는 있으나 마스크를 못 받았거나, 드래프트만 있는 경우
                 # 🔴 드래프트는 있는데 트리가 없는 경우.
@@ -441,6 +473,8 @@ class DDTreeRuntime:
             else:
                 emitted = sampled[:1]
 
+            self._emitted[self.all_req_ids[i]] = (
+                self._emitted.get(self.all_req_ids[i], 0) + len(emitted))
             out[i, : len(emitted)] = torch.tensor(emitted, dtype=torch.int64)
 
         _r = out.to(logits.device), paths
