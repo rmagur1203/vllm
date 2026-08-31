@@ -10,6 +10,7 @@ DDTree 트리 구성 — vLLM 통합용.
 from __future__ import annotations
 
 import heapq
+import os
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -137,6 +138,58 @@ def build_tree(
     )
 
 
+# float 임시본이 한 번에 잡을 수 있는 최대 바이트. 배치 전체를 한꺼번에
+# float 로 올리면 [요청수 x 깊이 x vocab] 이라 배치가 크면 GiB 단위가 된다.
+#
+# 실측 (요청 64, vocab 151936, 깊이 15, A6000): 결과는 상한과 무관하게 동일하고
+# 속도-메모리만 맞바꾼다.
+#     16 MiB  15.67 ms  최대할당  310 MiB
+#     64 MiB  12.34 ms  최대할당  406 MiB   ← 기본값
+#    256 MiB  11.47 ms  최대할당  790 MiB
+#   무제한     11.13 ms  최대할당 1391 MiB
+# 배치가 큰 상황은 곧 메모리가 빠듯한 상황이라 안전 쪽을 기본으로 둔다.
+_CAST_BUDGET = int(os.environ.get("VLLM_DDTREE_CAST_MIB", "64")) << 20
+
+
+def _topk_rows(rows: torch.Tensor, k_all: int):
+    """[행, vocab] → (정규화 log-prob 상위 k, 그 토큰 id). 둘 다 GPU 에 남는다."""
+    logits = rows.float()
+    top_logits, top_ids = torch.topk(logits, k=k_all, dim=-1)
+    log_z = torch.logsumexp(logits, dim=-1, keepdim=True)
+    return top_logits - log_z, top_ids
+
+
+def topk_from_logits(draft_logits: torch.Tensor, budget: int,
+                     topk_cap: int = 1 << 30):
+    """[..., depth, vocab] logits → (lp, ids, topk) numpy.
+
+    선행 차원은 그대로 유지하므로 [depth, vocab] 도 [요청, depth, vocab] 도 받는다.
+
+    🔴 **D2H 는 호출당 정확히 2회다.** 예전에는 요청마다 build_tree_from_logits
+       를 불러 2n회 났는데, 각 복사가 드래프터 GPU 작업이 끝날 때까지 파이프라인을
+       세우므로 배치 크기에 비례해 비용이 붙었다.
+    """
+    vocab = draft_logits.shape[-1]
+    topk = max(1, min(budget, vocab, topk_cap))
+    # 패딩용 여분 후보까지 한 번에 뽑는다 (topk_cap=1 이면 topk 가 1 이라 모자람)
+    k_all = min(vocab, max(topk, budget + 1))
+
+    flat = draft_logits.reshape(-1, vocab)
+    step = max(1, _CAST_BUDGET // (vocab * 4))
+    if step >= flat.shape[0]:
+        lp_g, ids_g = _topk_rows(flat, k_all)
+    else:
+        parts = [_topk_rows(flat[i:i + step], k_all)
+                 for i in range(0, flat.shape[0], step)]
+        lp_g = torch.cat([a for a, _ in parts])
+        ids_g = torch.cat([b for _, b in parts])
+
+    shape = tuple(draft_logits.shape[:-1]) + (k_all,)
+    lp = lp_g.to(device="cpu", dtype=torch.float32).numpy().reshape(shape)
+    ids = ids_g.to(device="cpu", dtype=torch.long).numpy().reshape(shape)
+    return lp, ids, topk
+
+
 def build_tree_from_logits(draft_logits: torch.Tensor, budget: int,
                           topk_cap: int = 1 << 30,
                           pad_to_budget: bool = True,
@@ -146,16 +199,10 @@ def build_tree_from_logits(draft_logits: torch.Tensor, budget: int,
                           allow_short: bool = False) -> Tree:
     """드래프터 logits [depth_limit, vocab] → Tree. topk/정규화는 GPU 에서.
 
-    topk_cap=1 이면 분기가 없는 순수 사슬이 된다 (이분법용)."""
-    vocab = draft_logits.shape[-1]
-    topk = max(1, min(budget, vocab, topk_cap))
-    # 패딩용 여분 후보까지 한 번에 뽑는다 (topk_cap=1 이면 topk 가 1 이라 모자람)
-    k_all = min(vocab, max(topk, budget + 1))
-    logits = draft_logits.float()
-    top_logits, top_ids = torch.topk(logits, k=k_all, dim=-1)
-    log_z = torch.logsumexp(logits, dim=-1, keepdim=True)
-    lp = (top_logits - log_z).to(device="cpu", dtype=torch.float32).numpy()
-    ids = top_ids.to(device="cpu", dtype=torch.long).numpy()
+    topk_cap=1 이면 분기가 없는 순수 사슬이 된다 (이분법용).
+    배치 경로는 topk_from_logits + shape_and_build 를 직접 쓴다 — 그래야 D2H 가
+    요청마다가 아니라 스텝마다 한 번씩 난다."""
+    lp, ids, topk = topk_from_logits(draft_logits, budget, topk_cap)
     return shape_and_build(lp, ids, budget, topk=topk, spine=spine,
                            depth_bonus=depth_bonus, dynamic_tau=dynamic_tau,
                            allow_short=allow_short, pad_to_budget=pad_to_budget)

@@ -5051,9 +5051,16 @@ class GPUModelRunner(
         self.draft_token_ids_event.synchronize()
         assert isinstance(self._draft_token_ids, torch.Tensor)
         num_spec_tokens = self._draft_token_ids.shape[1]
-        return self.draft_token_ids_cpu[
-            : len(req_ids), :num_spec_tokens
-        ].tolist(), req_ids
+        rows = self.draft_token_ids_cpu[: len(req_ids), :num_spec_tokens].tolist()
+        # --- DDTree: 요청마다 드래프트 길이가 다를 수 있다 ---
+        # 텐서는 최대 폭으로 패딩돼 있으므로, 실제 길이로 잘라야 스케줄러가
+        # 요청별로 올바른 개수를 잡는다. DraftTokenIds 는 list[list[int]] 라
+        # 길이가 달라도 된다.
+        _dd = getattr(self, "ddtree", None)
+        if _dd is not None and getattr(_dd, "draft_lens", None):
+            lens = _dd.draft_lens
+            rows = [r[: lens.get(i, len(r))] for i, r in enumerate(rows)]
+        return rows, req_ids
 
     def _copy_valid_sampled_token_count(
         self, next_token_ids: torch.Tensor, valid_sampled_tokens_count: torch.Tensor
@@ -5524,6 +5531,18 @@ class GPUModelRunner(
                         eplb_models += 1
 
                 self._setup_eagle3_aux_hidden_state_outputs()
+
+                # --- DDTree: 계층별 CUDA 이벤트 계측 (VLLM_DDTREE_LAYERPROF=1) ---
+                try:
+                    from vllm.v1.spec_decode.ddtree import layerprof as _lp
+
+                    if _lp.enabled():
+                        _lp.attach(self.model, "target")
+                        _d = getattr(self, "drafter", None)
+                        if _d is not None and getattr(_d, "model", None) is not None:
+                            _lp.attach(_d.model, "drafter")
+                except Exception as _e:  # noqa: BLE001
+                    logger.warning("DDTree layerprof 부착 실패: %s", _e)
 
                 # Resolve the MoE model, unwrapping VLM wrappers if needed.
                 # VLM models (e.g. KimiK25ForConditionalGeneration) wrap the

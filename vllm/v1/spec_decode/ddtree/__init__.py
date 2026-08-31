@@ -8,11 +8,12 @@
 """
 
 from vllm.v1.spec_decode.ddtree.tree import (Tree, build_tree, build_tree_from_logits,
-                                       flat_tree_mask, follow_tree)
+                                       flat_tree_mask, follow_tree,
+                                       topk_from_logits)
 from vllm.v1.spec_decode.ddtree.compact import (attention_caches, compact_kv_torch,
                                           compact_kv_triton)
 from vllm.v1.spec_decode.ddtree.gdn import (COMPACT_STATS, compact_gdn, register_state,
                                       tree_cols_tensor, tree_conv_columns)
 from vllm.v1.spec_decode.ddtree.runtime import DDTreeRuntime
 
-__all__ = ["COMPACT_STATS", "DDTreeRuntime", "Tree", "attention_caches", "build_tree", "build_tree_from_logits", "compact_gdn", "compact_kv_torch", "compact_kv_triton", "flat_tree_mask", "follow_tree", "register_state", "tree_cols_tensor", "tree_conv_columns"]
+__all__ = ["COMPACT_STATS", "DDTreeRuntime", "Tree", "attention_caches", "build_tree", "build_tree_from_logits", "compact_gdn", "compact_kv_torch", "compact_kv_triton", "flat_tree_mask", "follow_tree", "topk_from_logits", "register_state", "tree_cols_tensor", "tree_conv_columns"]

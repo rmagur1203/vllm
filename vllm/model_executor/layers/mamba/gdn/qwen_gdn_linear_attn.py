@@ -119,6 +119,16 @@ def set_ddtree_gdn_provider(fn) -> None:
     _DDTREE_GDN_PROVIDER = fn
 
 
+def _ddtree_active() -> bool:
+    """DDTree 공급자가 붙어 있는가.
+
+    🔴 이걸 먼저 봐야 한다. 아래 트리 정보 준비는 cu_seqlens / state_indices 를
+       CPU 로 내리는데(계층당 2회 D2H), DDTree 를 안 쓰는 사용자에게 그 비용을
+       지우면 안 된다. GDN 계층이 24개라 스텝당 48회다.
+    """
+    return _DDTREE_GDN_PROVIDER is not None
+
+
 def _ddtree_gdn(n_spec_reqs: int, T: int, width: int = 4):
     if _DDTREE_GDN_PROVIDER is None:
         return None
@@ -1369,18 +1379,24 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         if spec_sequence_masks is not None:
             # spec_state_indices_tensor is always set when spec_sequence_masks is set
             assert spec_state_indices_tensor is not None
-            _n_spec = attn_metadata.num_spec_decodes  # type: ignore[attr-defined]
-            _T = mixed_qkv_spec.shape[0] // max(1, _n_spec)
-            _info = _ddtree_gdn(_n_spec, _T, conv_weights.shape[-1])
-            self._ddtree_info = _info
-            if _info is not None:
-                from vllm.v1.spec_decode.ddtree.gdn import register_state
+            _info = None
+            if _ddtree_active():
+                from vllm.v1.spec_decode.ddtree.gdn import (register_state,
+                                                            tolist_cached)
 
-                register_state(
-                    id(self), conv_state, ssm_state,
-                    spec_state_indices_tensor[:_n_spec].tolist(),
-                    conv_weights.shape[-1], _info["keys"],
-                )
+                _n_spec = attn_metadata.num_spec_decodes  # type: ignore[attr-defined]
+                # 🔴 계층마다 내리면 스텝당 24회 D2H 다. 내용은 계층 간 동일하다.
+                _cl = tolist_cached("qsl", spec_query_start_loc[: _n_spec + 1])
+                _T = [_cl[i + 1] - _cl[i] for i in range(_n_spec)]
+                _info = _ddtree_gdn(_n_spec, _T, conv_weights.shape[-1])
+                if _info is not None:
+                    register_state(
+                        id(self), conv_state, ssm_state,
+                        tolist_cached("ssi",
+                                      spec_state_indices_tensor[:_n_spec]),
+                        conv_weights.shape[-1], _info["keys"],
+                    )
+            self._ddtree_info = _info
             mixed_qkv_spec = causal_conv1d_update(
                 mixed_qkv_spec,
                 conv_state,
@@ -1770,23 +1786,35 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.conv1d.weight.size(0), self.conv1d.weight.size(2)
         )
         # --- DDTree: 융합 경로에서도 트리 정보를 세운다 (conv + SSM 이 같은 _info) ---
-        _T = num_actual_tokens // max(1, num_requests)
-        _info = _ddtree_gdn(num_requests, _T, conv_weights.shape[-1])
-        self._ddtree_info = _info
-        if _info is not None:
-            from vllm.v1.spec_decode.ddtree.gdn import register_state
+        # 🔴 요청마다 드래프트 길이가 다를 수 있다. cu_seqlens 에서 실제 길이를
+        #    뽑는다 (균등 분할 가정을 쓰면 가변 길이에서 어긋난다).
+        _info = None
+        if _ddtree_active():
+            from vllm.v1.spec_decode.ddtree.gdn import (register_state,
+                                                        tolist_cached)
 
-            register_state(
-                id(self), conv_state, self.kv_cache[1],
-                state_indices[:num_requests].tolist(),
-                conv_weights.shape[-1], _info["keys"],
-            )
+            _cl = tolist_cached("cus", cu_seqlens[: num_requests + 1])
+            _T = [_cl[i + 1] - _cl[i] for i in range(num_requests)]
+            _info = _ddtree_gdn(num_requests, _T, conv_weights.shape[-1])
+            if _info is not None:
+                register_state(
+                    id(self), conv_state, self.kv_cache[1],
+                    tolist_cached("si", state_indices[:num_requests]),
+                    conv_weights.shape[-1], _info["keys"],
+                )
+        self._ddtree_info = _info
         # --- DDTree 진단: conv 상태를 스텝 경계로 덤프한다 (VLLM_DDTREE_CONVDUMP=N) ---
         #     합성 호출이 아니라 프로덕션 인자 그대로 잡아야 인계 검증이 성립한다.
         _cd = _ddtree_conv_dump_begin(
             self, conv_state, mixed_qkv[:num_actual_tokens], state_indices,
             num_accepted_tokens, num_requests,
             None if _info is None else _info["tree_cols"])
+        if _info is not None:
+            from vllm.v1.spec_decode.ddtree.gdn import validate_tree_inputs
+            validate_tree_inputs(
+                parents=_info["parents"], cu_seqlens=cu_seqlens,
+                state_indices=state_indices, tree_cols=_info.get("tree_cols"),
+                conv_state=conv_state, n_reqs=num_requests, tag="융합 conv")
         mixed_qkv = causal_conv1d_update(
             mixed_qkv[:num_actual_tokens],
             conv_state,
@@ -1830,6 +1858,20 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         # --- DDTree: 트리면 8토큰 상한 없는 우리 CUDA 커널로 ---
         _info = getattr(self, "_ddtree_info", None)
+        # 🔴 트리 정보가 없어도, 폭이 원본 커널의 8토큰 상한을 넘으면 원본으로
+        #    물러설 수 없다 (state_indices must have shape [N,S] with S<=8).
+        #    이때는 사슬 부모를 만들어 우리 커널로 처리한다 — 사슬은 원본과
+        #    의미가 같고 우리 커널에는 상한이 없다. 배치에 트리 있는 요청과
+        #    없는 요청이 섞이면 실제로 여기로 온다.
+        if _info is None and state_indices.size(1) > MAX_FUSED_GDN_MTP_TOKENS:
+            _cl = cu_seqlens[: num_requests + 1].tolist()
+            _mx = state_indices.size(1)
+            _rows = []
+            for _r in range(num_requests):
+                _L = _cl[_r + 1] - _cl[_r]
+                _rows.append([-1] + list(range(_L - 1)) + [-1] * (_mx - _L))
+            _info = {"parents": torch.tensor(_rows, dtype=torch.int32,
+                                             device=state_indices.device)}
         if _info is not None:
             from vllm.v1.spec_decode.ddtree.cuda_ext import get_ext
 
@@ -1841,6 +1883,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     # 🔴 상태 캐시 전체는 GB 단위다 — 이번 스텝이 건드리는 슬롯만 복제한다
                     _slots = state_indices[:num_requests].reshape(-1).unique()
                     _snap = self.kv_cache[1][_slots].clone()
+                from vllm.v1.spec_decode.ddtree.gdn import validate_tree_inputs
+                validate_tree_inputs(
+                    parents=_info["parents"], cu_seqlens=cu_seqlens,
+                    state_indices=state_indices, ssm_state=self.kv_cache[1],
+                    n_reqs=num_requests, tag="융합 SSM")
                 _ext.gdn_decode_tree_mtp(
                     mixed_qkv, a, b, self.A_log, self.dt_bias,
                     state_indices[:num_requests].contiguous(),
