@@ -13,7 +13,7 @@ QSA (sparse) attention path of Qwen3.8-Flash-Next, on a single GB10 (DGX Spark, 
 >
 > Published here so the code behind
 > [vllm-project/vllm#56081](https://github.com/vllm-project/vllm/issues/56081) and
-> [#54426 (comment)](https://github.com/vllm-project/vllm/issues/54426) is inspectable.
+> [#54426 (comment)](https://github.com/vllm-project/vllm/issues/54426#issuecomment-5602282777) is inspectable.
 
 ## Why int8 rather than fp8
 
