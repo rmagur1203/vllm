@@ -221,6 +221,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Pipeline parallelism.
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.is_first_pp_rank = get_pp_group().is_first_rank
+        # N-gram PLE layers hash raw token ids, so every PP rank that owns
+        # one needs input_ids even though only the first rank embeds them.
+        # input_ids are already delivered to all ranks via the input batch.
+        text_config = getattr(self.model_config, "hf_text_config", None)
+        self.pp_ranks_need_input_ids = bool(
+            getattr(text_config, "ple_layer_ids", None)
+        )
         self.is_last_pp_rank = get_pp_group().is_last_rank
 
         # Size the UVA buffer pools to the max number of concurrent in-flight
@@ -1800,8 +1807,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             **self.model_state.prepare_inputs(input_batch, self.req_states),
         }
         if not self.is_first_pp_rank:
-            # Update for non-first PP ranks.
-            model_inputs["input_ids"] = None
+            # Update for non-first PP ranks. Embedding happens only on the
+            # first rank (the model's forward guards on is_first_rank), so
+            # keeping input_ids alive for PLE models cannot double-embed.
+            if not self.pp_ranks_need_input_ids:
+                model_inputs["input_ids"] = None
             model_inputs["inputs_embeds"] = None
 
             # Prepare the intermediate tensors.
