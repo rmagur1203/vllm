@@ -282,7 +282,13 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         hidden_size = self.hidden_size
         prev_block_output: torch.Tensor | None = None
 
-        if get_pp_group().is_first_rank:
+        # The drafter is only ever constructed and run on the last PP rank
+        # (see GPUModelRunner: init_speculator / propose are gated on
+        # is_last_pp_rank), and its layers are not partitioned across ranks.
+        # So the whole draft step runs on one rank and must always take the
+        # embedding path; branching on is_first_rank sent the last rank into
+        # the intermediate-tensors path and tripped the assert below.
+        if intermediate_tensors is None:
             assert hidden_states is not None
             if inputs_embeds is None:
                 assert input_ids is not None
