@@ -48,6 +48,7 @@ from vllm.distributed.parallel_state import (
     resume_device_comms,
     suspend_device_comms,
 )
+from vllm.distributed.utils import get_pp_indices
 from vllm.distributed.weight_transfer import (
     WeightTransferEngine,
     WeightTransferEngineFactory,
@@ -245,6 +246,16 @@ class Worker(WorkerBase):
         text_config = self.model_config.hf_text_config
         return bool(getattr(text_config, "ple_layer_ids", None))
 
+    def _rank_owns_ple_layer(self) -> bool:
+        """Whether the loaded model on this rank has a PLE offload placeholder.
+
+        Only meaningful after load_model(); under PP some ranks own none.
+        """
+        from vllm.model_executor.layers.ple_offload_layer import PleOffloadLayer
+
+        model = self.model_runner.get_model()
+        return any(isinstance(m, PleOffloadLayer) for m in model.modules())
+
     def _validate_ple_offload_config(self) -> None:
         """Reject unsupported PLE offload execution modes."""
         parallel_config = self.parallel_config
@@ -253,8 +264,6 @@ class Worker(WorkerBase):
             unsupported.append("model runner V1")
         if not current_platform.is_cuda():
             unsupported.append(f"device={current_platform.device_type}")
-        if parallel_config.nnodes != 1:
-            unsupported.append(f"nnodes={parallel_config.nnodes}")
         if parallel_config.data_parallel_backend != "mp":
             unsupported.append(f"DP backend={parallel_config.data_parallel_backend}")
         if (
@@ -266,8 +275,29 @@ class Worker(WorkerBase):
                 f"({parallel_config.data_parallel_size_local}/"
                 f"{parallel_config.data_parallel_size} local ranks)"
             )
-        if parallel_config.pipeline_parallel_size != 1:
-            unsupported.append(f"PP={parallel_config.pipeline_parallel_size}")
+        # The CPU offload worker is spawned once, on global rank 0's node, and
+        # waits for dp_size * tp_size registrations: exactly the ranks of the
+        # first pipeline stage. PP and multi-node therefore work as long as
+        # every PLE layer sits in the first stage and that stage fits on the
+        # first node; otherwise some PLE-owning rank has no reachable worker.
+        pp_size = parallel_config.pipeline_parallel_size
+        if pp_size != 1 or parallel_config.nnodes != 1:
+            text_config = self.model_config.hf_text_config
+            ple_layer_ids = [int(i) for i in text_config.ple_layer_ids]
+            first_start, first_end = get_pp_indices(
+                text_config.num_hidden_layers, 0, pp_size
+            )
+            # Decoder layer `i` builds its PLE iff `(i + 1) in ple_layer_ids`.
+            if any(not first_start <= i - 1 < first_end for i in ple_layer_ids):
+                unsupported.append(
+                    f"PP={pp_size} with PLE layers outside the first pipeline "
+                    f"stage (ple_layer_ids={ple_layer_ids}, first stage owns "
+                    f"layers [{first_start}, {first_end}))"
+                )
+            if parallel_config.tensor_parallel_size > parallel_config.local_world_size:
+                unsupported.append(
+                    f"nnodes={parallel_config.nnodes} with TP spanning nodes"
+                )
         if parallel_config.prefill_context_parallel_size != 1:
             unsupported.append(f"PCP={parallel_config.prefill_context_parallel_size}")
         if parallel_config.decode_context_parallel_size != 1:
@@ -610,7 +640,10 @@ class Worker(WorkerBase):
 
         # Model loading constructs the PLE placeholders whose CUDA buffers are
         # registered by the model runner V2 offload client.
-        if self._ple_offload_enabled:
+        # `_ple_offload_enabled` is derived from the config, so it is also
+        # True on pipeline ranks that own no PLE layer; those must not build
+        # a connector (it would fail on "no PleOffloadLayer").
+        if self._ple_offload_enabled and self._rank_owns_ple_layer():
             model_runner = cast("GPUModelRunnerV2", self.model_runner)
             model_runner._setup_ple_offload(self.parallel_config._ple_offload_ipc_path)
 
