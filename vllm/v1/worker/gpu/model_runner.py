@@ -31,7 +31,7 @@ import torch.nn as nn
 import vllm.envs as envs
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphStat
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, replace
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import (
     get_dcp_group,
@@ -277,6 +277,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.speculative_config is not None:
             if self.is_last_pp_rank:
                 self.speculator = init_speculator(self.vllm_config, self.device)
+            elif self.speculative_config.draft_model_config is not None:
+                # Only the last PP rank builds the drafter, and building it
+                # constructs a draft VllmConfig via `replace(...)`, whose
+                # __post_init__ mutates sub-configs shared with the target
+                # config. Ranks that never build the drafter miss those
+                # side effects and end up with a different hybrid KV block
+                # size, which the KV cache group merge then rejects. Replay
+                # the construction here so every rank sees the same config.
+                replace(
+                    self.vllm_config,
+                    model_config=self.speculative_config.draft_model_config,
+                )
 
             if self.speculative_config.method in (
                 "eagle3",
