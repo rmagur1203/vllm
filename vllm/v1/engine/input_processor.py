@@ -278,6 +278,36 @@ class InputProcessor:
         else:
             request.request_id = f"{request.external_req_id}-{random_uuid():.8}"
 
+    def _maybe_reserve_tokens_for_structured_answer(
+        self, sampling_params: SamplingParams
+    ) -> None:
+        """Derive a thinking budget so a structured answer can always be emitted.
+
+        With a reasoning parser, the structured-output grammar is applied only
+        after the reasoning block ends (see
+        `StructuredOutputManager.should_fill_bitmask`). Nothing otherwise stops
+        the model from spending the entire `max_tokens` on reasoning, in which
+        case the request ends with `finish_reason="length"` and empty `content`.
+        Reserve a slice of `max_tokens` for the answer by capping reasoning via
+        `thinking_token_budget`, unless the request set one itself.
+        """
+        if sampling_params.structured_outputs is None:
+            return
+        if sampling_params.thinking_token_budget is not None:
+            return  # explicit request setting wins
+        reasoning_config = self.vllm_config.reasoning_config
+        if reasoning_config is None or not reasoning_config.enabled:
+            return  # no reasoning: the grammar applies from the first token
+        if self.structured_outputs_config.enable_in_reasoning:
+            return  # grammar applies during reasoning; nothing to reserve
+        ratio = self.structured_outputs_config.reasoning_reserve_ratio
+        if ratio <= 0.0:
+            return
+        max_tokens = sampling_params.max_tokens
+        assert max_tokens is not None
+        reserve = max(1, int(max_tokens * ratio))
+        sampling_params.thinking_token_budget = max(0, max_tokens - reserve)
+
     def process_inputs(
         self,
         request_id: str,
@@ -360,6 +390,8 @@ class InputProcessor:
                     prompt_token_ids, prompt_embeds
                 )
                 sampling_params.max_tokens = self.model_config.max_model_len - seq_len
+
+            self._maybe_reserve_tokens_for_structured_answer(sampling_params)
 
             sampling_params.update_from_generation_config(
                 self.generation_config_fields,

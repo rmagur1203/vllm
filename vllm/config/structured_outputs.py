@@ -40,6 +40,22 @@ class StructuredOutputsConfig:
     loaded and registered."""
     enable_in_reasoning: bool = False
     """Whether to use structured input for reasoning."""
+    reasoning_reserve_ratio: float = 0.25
+    """Fraction of `max_tokens` kept free for the structured answer when a
+    reasoning parser is active.
+
+    With a reasoning parser, the grammar is only enforced *after* the
+    reasoning block ends. If the model's reasoning consumes the whole
+    `max_tokens` budget, the request finishes with `finish_reason="length"`
+    and an empty `content` — the structured answer is never produced. To
+    prevent that, requests that use structured outputs and do not set
+    `thinking_token_budget` themselves get one derived as
+    `max_tokens - max(1, int(max_tokens * reasoning_reserve_ratio))`, so the
+    reasoning is force-closed with room left for the answer.
+
+    Set to 0 to disable the derived budget. Ignored when
+    `enable_in_reasoning` is set (the grammar then applies during reasoning
+    and nothing needs reserving)."""
 
     def compute_hash(self) -> str:
         """
@@ -70,5 +86,10 @@ class StructuredOutputsConfig:
             raise ValueError(
                 "disable_additional_properties is only supported "
                 "for the guidance backend."
+            )
+        if not 0.0 <= self.reasoning_reserve_ratio < 1.0:
+            raise ValueError(
+                "reasoning_reserve_ratio must be in [0, 1); got "
+                f"{self.reasoning_reserve_ratio}."
             )
         return self
